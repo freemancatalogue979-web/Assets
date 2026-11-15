@@ -2684,12 +2684,49 @@ class QueueWorker(QThread):
                         subject=outcome.verification_subject,
                     )
                     self._verification_store.upsert_result(verification)
+
+                    # Log the real temp mailbox when discovered
+                    if outcome.verification_mailbox:
+                        self._emit_log(
+                            "info",
+                            f"{task.email} — temp mailbox obtained: {outcome.verification_mailbox}",
+                        )
+
+                    # Log verification process steps
+                    if outcome.verification_message_received:
+                        self._emit_log(
+                            "info",
+                            f"{task.email} — verification message received "
+                            f"(from {outcome.verification_sender}, "
+                            f"subject “{outcome.verification_subject}”)",
+                        )
+                    if outcome.verification_action_url:
+                        self._emit_log(
+                            "info",
+                            f"{task.email} — verification link found: "
+                            f"{outcome.verification_action_url} (mode={outcome.verification_mode})",
+                        )
+
+                    # Log final verification result
+                    status = verification.verification_status.value
+                    level = "success" if status == "completed" else "warn"
+                    self._emit_log(
+                        level,
+                        f"{task.email} — verification {status} · mailbox="
+                        f"{outcome.verification_mailbox or '(not obtained)'} · "
+                        f"message_received={outcome.verification_message_received}",
+                    )
+
                     outcome.notes.append(
                         f"verification: {verification.verification_status.value} "
                         f"(message_received={verification.message_received})"
                     )
                     if verification.error_message:
                         outcome.notes.append(f"verification error: {verification.error_message}")
+                        self._emit_log(
+                            "warn",
+                            f"{task.email} — verification error: {verification.error_message}",
+                        )
                     if EMAIL_VERIFICATION_REQUIRED and verification.verification_status is not VerificationStatus.COMPLETED:
                         task.status = TaskStatus.FAILED
                         task.error_message = (
@@ -2699,6 +2736,10 @@ class QueueWorker(QThread):
                 except Exception as exc:  # verification must never kill the queue
                     LOGGER.exception("Verification result could not be stored for %s", task.email)
                     outcome.notes.append(f"verification store error: {type(exc).__name__}: {exc}")
+                    self._emit_log(
+                        "error",
+                        f"{task.email} — verification store error: {type(exc).__name__}: {exc}",
+                    )
 
             task.task_id = outcome.task_id or task.task_id
             task.session_id = outcome.session_id or task.session_id
@@ -4030,13 +4071,13 @@ class MainWindow(QMainWindow):
         return self._worker is not None and self._worker.isRunning()
 
     def generate_queue(self) -> None:
-        """Build N placeholder queue entries from the "API keys to create" spin box.
+        """Build N queue entries from the "API keys to create" spin box.
 
-        Entries are queue labels only — the real Emailnator temp mailbox is not
-        known until each run starts (open Emailnator → click "Go !" → read the
-        generated address). That real mailbox is then used for both sign-up and
-        verification, and is recorded in results.csv / verification_results.csv
-        when the run completes.
+        Entries are numbered account labels only — no fake e-mails. The real
+        temp mailbox is obtained by Emailnator when each run starts
+        (open inbox → click "Go !" → read address) and is used for both
+        sign-up and verification. The real mailbox is logged when discovered
+        and recorded in verification_results.csv when the run completes.
         """
         if self._is_busy():
             self._log("warn", "A queue is already running — cannot generate now.")
@@ -4044,10 +4085,10 @@ class MainWindow(QMainWindow):
         count = int(self.spn_keys_count.value())
         added = 0
         for i in range(1, count + 1):
-            email = f"temp-mailbox-{i}@emailnator-temp.invalid"
-            if any(t.email.casefold() == email.casefold() for t in self._tasks):
+            label = f"account-{i}"
+            if any(t.email.casefold() == label.casefold() for t in self._tasks):
                 continue
-            task = EmailTask(email=email)
+            task = EmailTask(email=label)
             self._tasks.append(task)
             added += 1
         self._rebuild_task_index()
@@ -4056,8 +4097,8 @@ class MainWindow(QMainWindow):
         self._log(
             "info",
             f"Generated {added} queue entr{'y' if added == 1 else 'ies'} "
-            f"(total {len(self._tasks)}). Placeholder labels only — each run "
-            f"generates its own real Emailnator temp mailbox when it starts.",
+            f"(total {len(self._tasks)}). Numbered account labels — real "
+            f"temp mailboxes are obtained from Emailnator when each run starts.",
         )
         if EMAIL_VERIFICATION_ENABLED:
             self._log(
