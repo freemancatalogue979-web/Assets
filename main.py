@@ -67,7 +67,17 @@ BROWSER_USE_MODEL = ""
 TASK_TIMEOUT_SECONDS = 600
 
 # How often the run status endpoint is polled, in seconds.
-POLL_INTERVAL_SECONDS = 2.0
+POLL_INTERVAL_SECONDS = 1.0
+
+# Print the agent's full internal event stream (core/llm/worker plumbing).
+# Off by default: it is dozens of lines per action and mostly noise.
+VERBOSE_EVENTS = False
+
+# Emit a one-line progress heartbeat (elapsed + actions) this often, in seconds.
+HEARTBEAT_SECONDS = 10.0
+
+# Maximum number of agent-action lines written per task (keeps the log readable).
+MAX_STEP_LINES_PER_TASK = 40
 
 # Pause between two consecutive email tasks, in seconds.
 DELAY_BETWEEN_TASKS_SECONDS = 1.5
@@ -193,7 +203,9 @@ def mask_secret(value: str) -> str:
         return ""
     if len(value) <= 8:
         return "*" * len(value)
-    return f"{value[:4]}{'*' * 6}{value[-2:]}"
+    if len(value) <= 14:
+        return f"{value[:3]}{'*' * 5}{value[-2:]}"
+    return f"{value[:6]}{'*' * 6}{value[-3:]}"
 
 
 def human_duration(seconds: float | None) -> str:
@@ -376,6 +388,7 @@ class EmailTask:
     duration_seconds: float | None = None
     attempt: int = 0
     notes: list[str] = field(default_factory=list)
+    progress: str = ""          # live "running · 0:42 · 12 actions" line (UI only)
 
     def to_row(self) -> dict[str, str]:
         return {
@@ -1271,8 +1284,11 @@ class BrowserUseService:
 
         deadline = started + self.task_timeout
         last_event_id: int | None = None
+        seen_event_ids: set[int] = set()
         last_status = ""
-        waiting_announced = False
+        last_line = ""
+        step_lines = 0
+        next_heartbeat = started + HEARTBEAT_SECONDS
         notes: list[str] = []
 
         while True:
@@ -1334,27 +1350,44 @@ class BrowserUseService:
                 self._pause(self.poll_interval, should_stop)
                 continue
 
-            # Progressive event log (thoughts, navigation, browser status).
+            # Progressive activity feed (deduplicated, noise filtered).
             try:
-                events, last_event_id = self.run_events(run_id, last_event_id)
+                events, next_after = self.run_events(run_id, last_event_id)
             except Exception:
-                events = []
+                events, next_after = [], last_event_id
+            if next_after is not None:
+                # Never lose the cursor: a null next_after used to replay every
+                # event from the beginning on the next poll.
+                last_event_id = next_after
             for event in events:
-                line = describe_run_event(event)
-                if not line:
+                event_id = getattr(event, "id", None)
+                if isinstance(event_id, int):
+                    if event_id in seen_event_ids:
+                        continue
+                    seen_event_ids.add(event_id)
+                    last_event_id = event_id if last_event_id is None else max(last_event_id, event_id)
+                    if len(seen_event_ids) > 5000:
+                        seen_event_ids = set(sorted(seen_event_ids)[-2000:])
+
+                line = describe_run_event(event, verbose=VERBOSE_EVENTS)
+                if not line or line == last_line:
                     continue
+                if line.startswith("Action") and step_lines >= MAX_STEP_LINES_PER_TASK:
+                    continue
+                last_line = line
+                if line.startswith("Action"):
+                    step_lines += 1
                 notes.append(line)
                 del notes[:-200]
                 emit("step", line)
-                blob = json.dumps(getattr(event, "data", {}) or {}, default=str).lower()
-                if not waiting_announced and any(
-                    keyword in blob
-                    for keyword in ("captcha", "human verification", "verify you are human",
-                                    "recaptcha", "hcaptcha", "two-factor", "2fa code")
-                ):
-                    waiting_announced = True
-                    emit("warn", "Human verification detected — the agent will stop rather "
-                                 "than bypass it. Open the live view to assist.")
+
+            if time.monotonic() >= next_heartbeat and status not in {"completed", "failed", "cancelled"}:
+                next_heartbeat = time.monotonic() + HEARTBEAT_SECONDS
+                elapsed = human_duration(time.monotonic() - started)
+                action = next((n for n in reversed(notes) if n.startswith("Action")), "")
+                detail = f" · {action.replace('Action · ', '')[:70]}" if action else ""
+                # Progress goes to the current-email card, not the activity log.
+                emit("progress", f"{status} · {elapsed} · {step_lines} action(s){detail}")
 
             if status in {"completed", "failed", "cancelled"}:
                 return self._collect(
@@ -1521,36 +1554,76 @@ class BrowserUseService:
         )
 
 
+# Internal plumbing event types: dozens per action, never useful in the log.
+_NOISE_EVENTS = {
+    "core.event", "core.spawn", "llm.request", "llm.response",
+    "worker.started", "worker.session_released", "worker.released",
+    "workspace.ready", "state.promoted", "outputs.promoted",
+    "browser.attached", "browser.released", "run.dispatched",
+    "run.dispatching", "task.updated", "step.started", "step.completed",
+}
+
+# Event types worth one line, mapped to a short label.
 _EVENT_LABELS = {
-    "browser.ready": "Browser ready",
-    "browser.reattached": "Browser re-attached",
+    "run.created": "Run created",
     "run.started": "Run started",
     "run.completed": "Run completed",
     "run.failed": "Run failed",
     "run.cancelled": "Run cancelled",
     "run.dispatch_failed": "Run dispatch failed",
-    "step.started": "Step started",
-    "step.completed": "Step completed",
+    "browser.ready": "Browser ready",
+    "browser.reattached": "Browser re-attached",
+    "step": "Action",
+    "action": "Action",
 }
 
+# Keys that carry the agent's human-readable activity.
+_TEXT_KEYS = ("message", "thought", "text", "description", "detail", "summary",
+              "action", "next_goal", "url", "step")
 
-def describe_run_event(event: Any) -> str:
-    """Turn a RunEvent into one readable activity-log line."""
-    event_type = str(getattr(event, "type", "") or "")
+_CHALLENGE_WORDS = ("captcha", "verify you are human", "recaptcha", "hcaptcha",
+                    "two-factor", "2fa code", "verification code")
+
+
+def _event_text(event: Any) -> str:
+    """Pull the agent's readable activity out of an event payload."""
     data = getattr(event, "data", None) or {}
-    label = _EVENT_LABELS.get(event_type)
+    if not isinstance(data, dict):
+        return ""
+    for key in _TEXT_KEYS:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().splitlines()[0][:220]
+        if isinstance(value, dict):
+            for inner in _TEXT_KEYS[:6]:
+                text = value.get(inner)
+                if isinstance(text, str) and text.strip():
+                    return text.strip().splitlines()[0][:220]
+    return ""
+
+
+def describe_run_event(event: Any, *, verbose: bool = False) -> str:
+    """Turn a RunEvent into one readable activity-log line.
+
+    Returns "" for internal plumbing events unless ``verbose`` is set, so the
+    log shows what the agent *did*, not what the runtime *thought*.
+    """
+    event_type = str(getattr(event, "type", "") or "").strip()
+    if not event_type:
+        return ""
+    key = event_type.lower()
+    label = _EVENT_LABELS.get(key)
+    text = _event_text(event)
+    if key in _NOISE_EVENTS and not verbose:
+        # A plumbing event is only worth a line when it carries real activity
+        # text (the agent's thought/action is sometimes wrapped in core.event).
+        if not text:
+            return ""
+        return f"Action · {text}"
     if label is None:
-        if not event_type:
+        if not verbose and not text:
             return ""
         label = event_type.replace("_", " ").replace(".", " · ")
-    text = ""
-    if isinstance(data, dict):
-        for key in ("message", "thought", "text", "description", "detail", "summary",
-                    "step", "action", "url"):
-            value = data.get(key)
-            if isinstance(value, str) and value.strip():
-                text = value.strip().splitlines()[0][:240]
-                break
     if text and text.lower() != label.lower():
         return f"{label} · {text}"
     return label
@@ -1569,6 +1642,7 @@ except ImportError as _qt_core_error:  # pragma: no cover
     fail_missing_qt(_qt_core_error)
 
 LOG_LEVELS = {"info", "step", "check", "success", "warn", "error"}
+PROGRESS_LEVEL = "progress"
 
 
 class ConnectionCheckThread(QThread):
@@ -1602,6 +1676,7 @@ class QueueWorker(QThread):
     log_message = pyqtSignal(str, str)            # level, message
     queue_state_changed = pyqtSignal(str)         # starting|running|paused|stopping|stopped|finished
     current_email_changed = pyqtSignal(str)       # "" when idle
+    progress_changed = pyqtSignal(str, str)       # email, "running · 0:42 · 12 actions"
     summary_ready = pyqtSignal(dict)              # counters for the cards
 
     def __init__(
@@ -1714,6 +1789,7 @@ class QueueWorker(QThread):
                 break
             self._emit_state("running")
 
+            task.progress = ""
             self.current_email_changed.emit(task.email)
             self._emit_log("info", f"[{index}/{len(self._tasks)}] Processing {task.email}")
             self._process(task)
@@ -1757,6 +1833,11 @@ class QueueWorker(QThread):
             self._persist(task)
 
             def emit(level: str, message: str, _task: EmailTask = task) -> None:
+                if level == PROGRESS_LEVEL:
+                    # Live progress feeds the current-email card, not the log.
+                    task.progress = message
+                    self.progress_changed.emit(_task.email, message)
+                    return
                 self._emit_log(level, f"{_task.email} — {message}")
 
             def on_created(run_id: str, session_id: str, live_url: str) -> None:
@@ -1765,8 +1846,6 @@ class QueueWorker(QThread):
                 task.live_url = live_url
                 self.task_updated.emit(task.copy())
                 self._persist(task)
-                if live_url:
-                    self._emit_log("info", f"{task.email} — live browser view available.")
 
             try:
                 outcome = self._service.execute(
@@ -2472,6 +2551,7 @@ class MainWindow(QMainWindow):
         self._service: BrowserUseService | None = None
         self._run_state = "Idle"
         self._live_view_opened: set[str] = set()
+        self._progress_text = ""
 
         # ---- widgets ----------------------------------------------------
         root = QWidget()
@@ -2932,8 +3012,17 @@ class MainWindow(QMainWindow):
             self.card_current.set_value("—", "idle")
         else:
             display = email if len(email) <= 26 else email[:24] + "…"
-            self.card_current.set_value(display, "processing now")
+            self.card_current.set_value(display, "starting…")
         self.card_current.setToolTip(email)
+
+    def _on_progress(self, email: str, text: str) -> None:
+        """Live heartbeat: keeps the dashboard visibly alive during long runs."""
+        if not text:
+            return
+        self._progress_text = text
+        self.card_current.set_value(
+            (email if len(email) <= 26 else email[:24] + "…"), text[:64]
+        )
 
     # ==================================================================
     #  Queue table
@@ -2948,7 +3037,8 @@ class MainWindow(QMainWindow):
                 task.status.value,
                 (task.task_id[:8] if task.task_id else "—"),
                 human_duration(task.duration_seconds),
-                task.error_message or (", ".join(task.notes[-2:]) if task.notes else "—"),
+                (task.progress if task.status is TaskStatus.RUNNING and task.progress
+                 else task.error_message or (task.notes[-1] if task.notes else "—")),
             ]
             for column, text in enumerate(values):
                 item = self.table.item(row, column)
@@ -3186,6 +3276,7 @@ class MainWindow(QMainWindow):
         worker.log_message.connect(self._on_worker_log)
         worker.queue_state_changed.connect(self._on_queue_state)
         worker.current_email_changed.connect(self._set_current_email)
+        worker.progress_changed.connect(self._on_progress)
         worker.summary_ready.connect(self._on_summary)
         worker.finished.connect(self._on_worker_finished)
 

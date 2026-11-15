@@ -43,7 +43,10 @@ Everything lives in the configuration block at the top of `main.py`:
 | `OUTPUT_DIR` | Optional absolute folder for the output files |
 | `BROWSER_USE_MODEL` | Optional model override (empty = SDK default) |
 | `TASK_TIMEOUT_SECONDS` | Watchdog per e-mail task (default 600 s) |
-| `POLL_INTERVAL_SECONDS` | Run-status poll interval |
+| `POLL_INTERVAL_SECONDS` | Run-status poll interval (default 1 s) |
+| `VERBOSE_EVENTS` | Print the agent's raw internal event stream (`core`/`llm` plumbing) |
+| `HEARTBEAT_SECONDS` | How often the live progress line on the current-email card updates |
+| `MAX_STEP_LINES_PER_TASK` | Cap on agent-action lines written per task |
 | `DELAY_BETWEEN_TASKS_SECONDS` | Pause between two consecutive tasks |
 | `MAX_TASK_RETRIES` | Retries for *recoverable* failures only |
 | `PROXY_COUNTRY_CODE` | Browser Use proxy region (`""` disables the proxy) |
@@ -72,6 +75,19 @@ DEFAULT_PASSWORD = "Staging!Pass9"
    run through `runs.cancel` and marks queued addresses `CANCELLED`.
 5. Watch **Live activity** (timestamped, colour-coded) and the **Task queue**
    tab — double-click a row to reopen its Browser Use live view.
+
+   The log shows what the agent *does*: `Run created`, `Browser ready`,
+   `Action · <thought/step>`, `Notice (not a blocker): …`, and the final
+   verdict. The runtime's internal plumbing (`core · event`,
+   `llm · request`, `worker · started`, …) is filtered out — a single agent
+   action emits a dozen of those and they only make the run look stuck. Set
+   `VERBOSE_EVENTS = True` if you ever want them.
+
+   While a task runs, the **Current email** card updates every
+   `HEARTBEAT_SECONDS` with `running · 1m 07s · 18 actions · <last action>`,
+   so you can always see it is alive. Event ids are deduplicated and the
+   cursor never rewinds, so no line is printed twice when the API returns a
+   null `nextAfter`.
 
 The interface is a sharp, square-cornered terminal style: Courier New
 throughout, hairline borders, high-contrast accents (blue = active,
@@ -116,6 +132,17 @@ The agent reports the blocker through the `blocker` field; free-text notices
 (such as “Email not verified”) are also recognised. The parked task keeps its
 `WAITING_FOR_USER` row, and **START** re-queues it (together with `FAILED` and
 `CANCELLED` rows) without touching completed results.
+
+### How long one address takes
+
+Each address is one autonomous cloud run: load the page, fill the form,
+submit, wait for the app, hunt the key, report. That is typically **30–90
+seconds**, and can hit the 600 s `TASK_TIMEOUT_SECONDS` when the target is
+slow. Because the queue is strictly sequential, N addresses ≈ N × that time.
+Two safeguards keep it honest: the heartbeat above shows live progress, and
+the per-task watchdog cancels anything that hangs. If you need to go faster,
+raise `POLL_INTERVAL_SECONDS` down to `0.5`, or run several app instances with
+different address lists.
 
 ## 4. What a task actually does
 
