@@ -1,6 +1,8 @@
 # Outputs produced at runtime
 results.csv
 results.csv.tmp
+verification_results.csv
+verification_results.csv.tmp
 key.txt
 key.txt.tmp
 *.log

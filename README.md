@@ -241,3 +241,90 @@ Statuses and CSV columns are enums/constants, and every outward-facing
 operation (run creation, polling, cancellation, persistence) is a small
 method, so the app is straightforward to extend — extra checks per task,
 another export format, or a different dashboard contract.
+
+## 8. E-mail verification (Emailnator) — authorised staging tests
+
+Set `EMAIL_VERIFICATION_ENABLED = True` in the configuration block to run the
+combined authorised flow for each queued account. Every run performs all of
+the following in a **single** Browser Use session, using the same temp inbox
+throughout:
+
+1. Open Emailnator and wait for the inbox interface to load.
+2. Click the **Go !** inbox initialisation control (`name="goBtn"`).
+3. Read the generated temp mailbox address.
+4. Sign up on the VeriPhone staging page using that temp mailbox as the
+   account e-mail.
+5. Reach the dashboard and capture the account's test API key verbatim.
+6. Return to the **same** Emailnator inbox and find the verification message
+   from `support@veriphone.io` with subject **Verify your email for
+   veriphone.io**.
+7. Open it and validate that the verification link points to
+   `https://veriphone.io/__/auth/action?mode=verifyEmail`.
+
+Because the temp mailbox is generated during the run, sign-up and verification
+share the exact same inbox — the verification message is never looked up in a
+different mailbox.
+
+Results are appended (never truncated) to `verification_results.csv` with
+columns: `email, mailbox, message_received, verification_status, timestamp,
+error_message, action_url, mode, sender, subject`. Rows are keyed by e-mail
+address, so a later result replaces the earlier row for the same address. The
+API-key deliverable is still written to `results.csv` / `key.txt` as usual.
+
+### Workflow with temporary e-mails
+
+1. Import as many queue rows as accounts you want to create (one per line in
+   the TXT file — each row drives one combined run; you can set as many as you
+   need). When verification is enabled, each run generates its own temp
+   mailbox via Emailnator, so the imported row is a queue label and the real
+   account e-mail is recorded in `account_email` and in
+   `verification_results.csv`.
+2. Enable `EMAIL_VERIFICATION_ENABLED = True` and start the queue.
+3. Each run signs up with its temp mailbox, captures the key, then verifies
+   that same inbox. Results are recorded alongside the credential.
+
+#### Set how many API keys to create (GUI)
+
+Instead of importing a TXT file, use the **Setup & controls** tab:
+
+- **API keys:** spin box — how many test accounts / API keys to create.
+- **GENERATE QUEUE** — builds that many queue entries. Each entry runs one
+  combined Emailnator → sign-up → key capture → verification flow.
+- With verification enabled, each run generates its own temp mailbox via
+  Emailnator, so the placeholder queue address is just a label; the real
+  account e-mail is captured in `account_email` and `verification_results.csv`.
+- Then enter the test password and click **START**.
+
+#### Direct DOM (fast, no LLM agent) — optional
+
+The **Direct DOM (fast, no LLM agent)** checkbox enables `EMAIL_VERIFY_DIRECT_DOM`.
+When on, Emailnator interactions (open inbox, click "Go !", read the temp
+mailbox, find the verification message, extract and validate the link) are
+driven by Playwright directly instead of the Browser Use LLM agent — faster and
+no per-run LLM cost.
+
+Requires `playwright` plus a Chromium browser and network access to
+`emailnator.com`:
+
+```
+pip install playwright
+playwright install chromium
+```
+
+That host is not reachable from this sandbox, so the Browser Use cloud agent
+remains the default (`EMAIL_VERIFY_DIRECT_DOM = False`). Flip it to `True` in
+your own environment to use the direct driver (`EmailnatorDirect` class in
+`main.py`).
+
+### Safety
+
+Nothing is bypassed: CAPTCHAs, rate limits, missing inboxes, unexpected
+senders, or incorrect subjects are reported as failed/pending verifications
+and never worked around. Verification is additive by default
+(`EMAIL_VERIFICATION_REQUIRED = False`), so an incomplete verification never
+blocks the API-key deliverable. Set `EMAIL_VERIFICATION_REQUIRED = True` to
+mark a task `FAILED` when its e-mail could not be verified.
+
+> Point everything at a staging domain you own and are permitted to test.
+> Temporary public inboxes are best-effort and may be rate-limited or
+> unreliable — treat verification results as signals, not guarantees.
