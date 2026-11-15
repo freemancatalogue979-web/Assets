@@ -1,0 +1,19 @@
+# Outputs produced at runtime
+results.csv
+results.csv.tmp
+key.txt
+key.txt.tmp
+*.log
+
+# Local configuration overrides (may hold real keys)
+_overrides.local.py
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS noise
+.DS_Store
+Thumbs.db

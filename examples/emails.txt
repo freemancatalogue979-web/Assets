@@ -1,0 +1,13 @@
+# VeriPhone Account Manager — sample email list
+# One address per line. Empty lines, duplicates and malformed lines
+# are skipped automatically; the original order is preserved.
+
+test1@example.com
+test2@example.com
+
+test3@staging.example.org
+  test4@staging.example.org  
+
+# duplicate and invalid entries below are ignored on import
+test1@example.com
+not-an-address
