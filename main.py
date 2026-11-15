@@ -2227,11 +2227,14 @@ def build_full_flow_prompt(
 1. Open Emailnator ({emailnator_url}). Wait for the inbox interface to load.
 2. Click the inbox initialisation control: the button with name="goBtn" and
    visible text "Go !". Wait for the inbox to become available.
-3. Identify the generated temp mailbox address and record it in mailbox.
-4. Open the VeriPhone signup page ({target_url}). Sign up using the temp
-   mailbox from step 3 as the account e-mail and the test password (the
-   password is injected from the secret binding — never echo it in your text
-   output). Submit the form.
+3. READ the generated temp mailbox address shown by Emailnator. It will look
+   like a real e-mail address (e.g. something@emailnator.com). Record it in
+   mailbox. The queue label "account-N" is NOT an e-mail address — never type
+   it into an e-mail field.
+4. Open the VeriPhone signup page ({target_url}). Sign up using the REAL temp
+   mailbox you read in step 3 as the account e-mail — NOT the queue label —
+   and the test password (the password is injected from the secret binding —
+   never echo it in your text output). Submit the form.
 5. STOP ONLY for a real human challenge: a CAPTCHA, a "verify you are human"
    check, an SMS/authenticator code prompt, or a hard rate-limit wall. In that
    case set human_verification_required = true, set blocker to exactly one of
@@ -2245,9 +2248,9 @@ def build_full_flow_prompt(
 7. Continue to the dashboard (often the page right after signup). Confirm the
    test account is authenticated (account menu, avatar or e-mail visible). If
    signup says the account already exists, do NOT stop and do NOT re-register:
-   sign in through the normal login page with this temp mailbox and the same
-   test password, then continue to step 8. Only report failure if sign-in is
-   genuinely refused.
+   sign in through the normal login page with the REAL temp mailbox from step 3
+   and the same test password, then continue to step 8. Only report failure if
+   sign-in is genuinely refused.
 8. {credential_step}
 9. Now verify the e-mail: return to Emailnator and open the SAME temp inbox
    (the mailbox from step 3). Look for a message from {sender} with subject
