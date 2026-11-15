@@ -47,6 +47,7 @@ Everything lives in the configuration block at the top of `main.py`:
 | `DELAY_BETWEEN_TASKS_SECONDS` | Pause between two consecutive tasks |
 | `MAX_TASK_RETRIES` | Retries for *recoverable* failures only |
 | `PROXY_COUNTRY_CODE` | Browser Use proxy region (`""` disables the proxy) |
+| `CREDENTIAL_HINT` | Where the test key lives, e.g. `"Settings > Developer > Test API keys"` |
 
 For local secrets you can also drop a `_overrides.local.py` next to `main.py`
 (git-ignored); only names already defined in the config block are accepted:
@@ -72,8 +73,33 @@ DEFAULT_PASSWORD = "Staging!Pass9"
 5. Watch **Live activity** (timestamped, colour-coded) and the **Task queue**
    tab — double-click a row to reopen its Browser Use live view.
 
+The interface is a sharp, square-cornered terminal style: Courier New
+throughout, hairline borders, high-contrast accents (blue = active,
+green = completed, amber = parked, red = failed).
+
 Statuses: `PENDING`, `RUNNING`, `WAITING_FOR_USER`, `COMPLETED`, `FAILED`,
 `CANCELLED`.
+
+### Notices vs. blockers, and capturing the test key
+
+An “Email not verified” banner is **not** a wall: the agent records it in
+`verification_notices` and carries on to the dashboard, because these staging
+flows usually render the dashboard straight after signup. Only a real human
+challenge (CAPTCHA, SMS/authenticator prompt, hard rate-limit wall) parks the
+task, and even then the app refuses to bypass it.
+
+The credential hunt walks the dashboard test panel → any “developer / API keys”
+page → the post-signup key screen, and reports where it found the key in
+`credential_location`. If your staging app keeps the key somewhere specific,
+set `CREDENTIAL_HINT` and the agent goes straight there instead of searching:
+
+```python
+CREDENTIAL_HINT = "Settings > Developer > Test API keys"
+```
+
+A captured key is written to `key.txt` (masked everywhere else). If the
+dashboard is reached but no key exists, the task still completes and the log
+warns you that nothing was displayed — nothing is ever invented.
 
 ### When a task parks as `WAITING_FOR_USER`
 
@@ -83,9 +109,7 @@ instead of assuming a CAPTCHA:
 | Blocker | What the operator is told |
 | --- | --- |
 | `captcha` | Solve the challenge yourself in the live view, then re-run the address |
-| `email_verification` | Confirm the test inbox / mail fixture for that address, then re-run it |
 | `phone_verification` | Use the approved test number / fixture, then re-run it |
-| `rate_limit` | Wait for the limit to reset, then re-run it |
 | anything else | Review the notice, resolve it via the approved test path, re-run |
 
 The agent reports the blocker through the `blocker` field; free-text notices
@@ -98,11 +122,12 @@ The agent reports the blocker through the `blocker` field; free-text notices
 `BrowserUseService.create_run()` posts to `POST /api/v4/runs` with:
 
 * a fixed QA instruction (signup → validation → submit → dashboard check →
-  test-credential panel) that explicitly forbids bypassing protections,
+  credential hunt) that separates **passive notices** from **hard challenges**
+  and explicitly forbids bypassing protections,
 * an `outputSchema` so each run returns structured fields
   (`signup_completed`, `dashboard_reached`, `account_email`,
-  `test_credential`, `human_verification_required`, `blocker`,
-  `failure_reason`, `checks`),
+  `test_credential`, `credential_location`, `verification_notices`,
+  `human_verification_required`, `blocker`, `failure_reason`, `checks`),
 * a `maxCostUsd` ceiling,
 * a `secretBindings` entry for the password, restricted to the target host —
   the password is never inlined in the task text,

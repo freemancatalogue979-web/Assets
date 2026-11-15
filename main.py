@@ -20,6 +20,11 @@ Requirements:
     PyQt6
     browser-use-sdk
 
+Interface
+---------
+A sharp, square-cornered terminal-style dashboard: Courier New throughout,
+hairline borders, no animations.
+
 Scope & safety
 --------------
 This tool is built for *authorized* testing only: point TARGET_URL at a
@@ -79,6 +84,12 @@ PROXY_COUNTRY_CODE = "us"
 
 # Log a summary of the files the agent attached to a run (screenshots…).
 LOG_ATTACHMENTS = False
+
+# Optional hints that point the agent straight at the test credential, e.g.
+#   CREDENTIAL_HINT = "Settings > Developer > Test API keys"
+#   CREDENTIAL_HINT = "the 'Test key' row on /dashboard"
+# Leave empty to let the agent discover the credential panel itself.
+CREDENTIAL_HINT = ""
 
 # ==========================================================================
 #  End of configuration
@@ -751,14 +762,32 @@ TASK_OUTPUT_SCHEMA: dict[str, Any] = {
         },
         "human_verification_required": {
             "type": "boolean",
-            "description": "True if a CAPTCHA/verification step blocked progress.",
+            "description": (
+                "True ONLY when a CAPTCHA / human challenge / 2FA prompt is actually "
+                "waiting for a human and stops you from continuing. A passive 'verify "
+                "your e-mail' notice or a rate-limit notice is NOT a human challenge."
+            ),
         },
         "blocker": {
             "type": "string",
             "description": (
-                "What blocked the run when human_verification_required is true. One of: "
-                "captcha, email_verification, phone_verification, rate_limit, other. "
-                "Empty otherwise."
+                "What stopped the run when human_verification_required is true. One of: "
+                "captcha, phone_verification, other. Empty otherwise."
+            ),
+        },
+        "verification_notices": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Passive notices seen (e.g. 'verify your e-mail'), recorded only. "
+                "They must not stop the run."
+            ),
+        },
+        "credential_location": {
+            "type": "string",
+            "description": (
+                "Where the approved test credential was found: 'dashboard', "
+                "'post_signup_page', 'account_settings' or 'not_found'."
             ),
         },
         "failure_reason": {
@@ -875,13 +904,17 @@ class ConnectionProbe:
     detail: str = ""
 
 
-def build_task_prompt(email: str, target_url: str) -> str:
-    """Compose the browser-agent instruction for one authorized test account.
+_DEFAULT_CREDENTIAL_STEP = """Locate the approved test credential and copy it verbatim. Look, in order, at:
+   a. the dashboard's test-credential / API-key panel or card;
+   b. any "test mode", "developer" or "API keys" page reachable from the
+      dashboard menu or account settings;
+   c. a key revealed right after signup.
+   Put it in test_credential and say where it came from in credential_location.
+   If it is genuinely not present, set test_credential to "" and
+   credential_location to "not_found" — do not invent a value."""
 
-    The password is never inlined here: the agent receives it through the
-    ``secret`` binding instead, so it stays out of task text and logs.
-    """
-    return f"""You are running an AUTHORIZED automated QA test of a staging
+
+_TASK_PROMPT_TEMPLATE = """You are running an AUTHORIZED automated QA test of a staging
 registration flow that the operator owns. Only use the pages described below;
 never touch production systems, real payment details or third-party accounts.
 
@@ -889,7 +922,7 @@ Target signup page: {target_url}
 
 Test account (created for this test run only)
   e-mail:   {email}
-  password: {{secret:{SECRET_ALIAS}}}
+  password: {{secret:{secret_alias}}}
 
 Steps
 1. Open the signup page. Confirm the page loads and the signup form is visible.
@@ -898,23 +931,54 @@ Steps
    field (it is injected from the secret binding — never echo it in your text
    output) and confirm the field is accepted.
 4. Submit the form.
-5. If a CAPTCHA, e-mail verification, phone verification, rate limit or any
-   other account protection appears: STOP immediately. Do NOT attempt to solve,
-   bypass or retry it. Set human_verification_required = true, set blocker to
-   exactly one of captcha / email_verification / phone_verification /
-   rate_limit / other, and describe the notice you saw in failure_reason.
-6. If registration succeeds, confirm the app lands on the expected dashboard and
-   that the test account is authenticated (account menu / e-mail visible).
-7. Locate the dashboard's test-credential panel and read the approved test
-   credential displayed there (test API key or fixture value). Do not collect
-   production tokens, cookies or third-party credentials.
-8. Stop as soon as the dashboard is confirmed. Do not log out, do not change
-   settings, do not invite users.
+5. STOP ONLY for a real human challenge: a CAPTCHA, a "verify you are human"
+   check, an SMS/authenticator code prompt, or a hard rate-limit wall. In that
+   case set human_verification_required = true, set blocker to exactly one of
+   captcha / phone_verification / other, and describe it in failure_reason.
+   Do NOT attempt to solve, bypass or retry it.
+6. PASSIVE NOTICES ARE NOT BLOCKERS. If you only see a notice such as "Email
+   not verified", "Verify your e-mail to unlock everything", a pending-verification
+   banner or a "resend verification" link, record it in verification_notices and
+   KEEP GOING. These staging flows normally show the dashboard immediately after
+   signup — do not stop, do not log out, do not open the e-mail inbox.
+7. Continue to the dashboard (it is often the page right after signup). Confirm
+   the test account is authenticated (account menu, avatar or e-mail visible).
+8. {credential_step}
+9. Never collect production tokens, cookies, session tokens or third-party
+   credentials. Stop as soon as the credential is captured; do not log out, do
+   not change settings, do not invite users.
 
 Report the result using the provided output schema. Set signup_completed and
 dashboard_reached honestly; put a short reason in failure_reason when a step
 failed, and list the checks you performed in "checks".
 """
+
+
+def build_task_prompt(email: str, target_url: str, credential_hint: str = "") -> str:
+    """Compose the browser-agent instruction for one authorized test account.
+
+    The password is never inlined here: the agent receives it through the
+    ``secret`` binding instead, so it stays out of task text and logs.
+    ``credential_hint`` (optional) tells the agent exactly where the approved
+    test key lives, which is much faster than letting it search.
+    """
+    hint = (credential_hint or "").strip()
+    if hint:
+        step = (
+            "Locate the approved test credential and copy it verbatim. The operator "
+            f'has told you exactly where it is: "{hint}". Go there directly, read the '
+            "key, and put it in test_credential with credential_location set to that "
+            'location. If it is genuinely not there, set test_credential to "" and '
+            'credential_location to "not_found".'
+        )
+    else:
+        step = _DEFAULT_CREDENTIAL_STEP
+    return _TASK_PROMPT_TEMPLATE.format(
+        email=email,
+        target_url=target_url,
+        secret_alias=SECRET_ALIAS,
+        credential_step=step,
+    )
 
 
 def parse_agent_output(run: Any) -> dict[str, Any]:
@@ -980,6 +1044,7 @@ class BrowserUseService:
         poll_interval: float = POLL_INTERVAL_SECONDS,
         proxy_country: str = PROXY_COUNTRY_CODE,
         api_timeout: float = API_TIMEOUT_SECONDS,
+        credential_hint: str = CREDENTIAL_HINT,
     ) -> None:
         self.api_key = (api_key or "").strip()
         self.target_url = (target_url or "").strip()
@@ -990,6 +1055,7 @@ class BrowserUseService:
         self.poll_interval = max(0.25, float(poll_interval))
         self.proxy_country = (proxy_country or "").strip().lower()
         self.api_timeout = float(api_timeout)
+        self.credential_hint = (credential_hint or "").strip()
         self._client: Any = None
         self._client_lock = threading.Lock()
 
@@ -1101,7 +1167,7 @@ class BrowserUseService:
         if self.model:
             kwargs["model"] = self.model
         return self.client().runs.create(
-            build_task_prompt(email, self.target_url), **kwargs
+            build_task_prompt(email, self.target_url, self.credential_hint), **kwargs
         )
 
     def _target_host(self) -> str:
@@ -1386,8 +1452,22 @@ class BrowserUseService:
                 notes=notes,
             )
 
-        if _boolish(output.get("human_verification_required")):
-            blocker = str(output.get("blocker") or "").strip()
+        notices = output.get("verification_notices") or []
+        if isinstance(notices, list):
+            for notice in notices[:10]:
+                text = str(notice).strip()
+                if text:
+                    notes.append(f"notice: {text}")
+                    emit("warn", f"Notice (not a blocker): {text}")
+
+        blocker = str(output.get("blocker") or "").strip()
+        hard_challenge = _boolish(output.get("human_verification_required"))
+        if hard_challenge and normalize_blocker(blocker) in {"email_verification", "rate_limit"}:
+            # The agent mistook a notice for a hard block: keep the run going.
+            hard_challenge = False
+            emit("warn", f"Treating '{blocker}' as a passive notice, not a blocker.")
+
+        if hard_challenge:
             return TaskOutcome(
                 status=TaskStatus.WAITING_FOR_USER,
                 error=waiting_message(blocker, str(output.get("failure_reason") or "")),
@@ -1404,8 +1484,13 @@ class BrowserUseService:
         if signup and dashboard:
             account_email = str(output.get("account_email") or "").strip()
             credential = str(output.get("test_credential") or "").strip()
+            location = str(output.get("credential_location") or "").strip()
             if credential:
-                emit("success", "Test credential captured from the dashboard panel.")
+                where = f" ({location})" if location and location != "not_found" else ""
+                emit("success", f"Test credential captured{where} · {mask_secret(credential)}")
+            else:
+                emit("warn", "Dashboard reached, but no test credential was displayed. "
+                             "Point the agent at the right test panel (see README).")
             emit("success", "Dashboard reached — test account authenticated.")
             return TaskOutcome(
                 status=TaskStatus.COMPLETED,
@@ -1780,7 +1865,6 @@ try:  # noqa: E402
         QDesktopServices,
         QFont,
         QIcon,
-        QLinearGradient,
         QPainter,
         QPen,
         QPixmap,
@@ -1811,145 +1895,153 @@ try:  # noqa: E402
 except ImportError as _qt_error:  # pragma: no cover
     fail_missing_qt(_qt_error)
 
-COLOR_BG = "#0A0E13"
-COLOR_PANEL = "#111821"
-COLOR_PANEL_ALT = "#0D141C"
-COLOR_BORDER = "#1D2833"
-COLOR_TEXT = "#E7EEF7"
-COLOR_MUTED = "#8493A6"
-COLOR_ACCENT = "#4F7CFF"
-COLOR_ACCENT_HOVER = "#648CFE"
-COLOR_SUCCESS = "#34D399"
-COLOR_WARN = "#F5B851"
-COLOR_DANGER = "#F87171"
+# --------------------------------------------------------------------------
+#  Sharp terminal palette: hard edges, Courier New, high contrast
+# --------------------------------------------------------------------------
+COLOR_BG = "#07090C"
+COLOR_PANEL = "#0C1014"
+COLOR_PANEL_ALT = "#080B0E"
+COLOR_BORDER = "#27313B"
+COLOR_BORDER_LIGHT = "#3C4A57"
+COLOR_TEXT = "#E8F0F7"
+COLOR_MUTED = "#8B9AAB"
+COLOR_ACCENT = "#5AA9FF"
+COLOR_ACCENT_HOVER = "#7CBEFF"
+COLOR_SUCCESS = "#00E39A"
+COLOR_WARN = "#FFC24D"
+COLOR_DANGER = "#FF5F5F"
 
-FONT_STACK = ('"Inter", "Segoe UI Variable", "Segoe UI", "SF Pro Text", '
-              '"Helvetica Neue", "DejaVu Sans", Arial, sans-serif')
-MONO_STACK = ('"JetBrains Mono", "Cascadia Mono", "SF Mono", "Consolas", '
-              '"DejaVu Sans Mono", monospace')
+FONT_FAMILY = "Courier New"
+# Courier New is available on Windows, macOS and most Linux desktops. The
+# metric-compatible alternatives are only a fallback for machines without it.
+FONT_STACK = (f'"{FONT_FAMILY}", "CourierNew", "Courier New CYR", '
+              '"Nimbus Mono PS", "Liberation Mono", "DejaVu Sans Mono", monospace')
+MONO_STACK = FONT_STACK
 
 APP_STYLESHEET = f"""
 * {{
     font-family: {FONT_STACK};
+    font-size: 12px;
+    letter-spacing: 0.4px;
     outline: none;
 }}
 QWidget#Root {{
-    background: qlineargradient(x1:0, y1:0, x2:0.35, y2:1,
-        stop:0 #0B1017, stop:0.55 {COLOR_BG}, stop:1 #080C11);
+    background: {COLOR_BG};
 }}
 QFrame#Header {{
-    background: transparent;
-    border-bottom: 1px solid #182230;
+    background: {COLOR_PANEL_ALT};
+    border: none;
+    border-bottom: 1px solid {COLOR_BORDER};
 }}
 QLabel#AppTitle {{
     color: {COLOR_TEXT};
     font-size: 21px;
     font-weight: 700;
-    letter-spacing: 0.2px;
+    letter-spacing: 3px;
 }}
 QLabel#AppTagline {{
     color: {COLOR_MUTED};
-    font-size: 12px;
+    font-size: 11px;
+    letter-spacing: 1px;
 }}
 QLabel#Version {{
-    color: #55657A;
-    font-size: 11px;
+    color: #56636F;
+    font-size: 10px;
+    letter-spacing: 1px;
 }}
 QFrame#Card {{
     background: {COLOR_PANEL};
     border: 1px solid {COLOR_BORDER};
-    border-radius: 12px;
+    border-radius: 0px;
 }}
 QFrame#StatCard {{
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-        stop:0 #131C26, stop:1 #101720);
+    background: {COLOR_PANEL};
     border: 1px solid {COLOR_BORDER};
-    border-radius: 12px;
+    border-top: 2px solid {COLOR_BORDER_LIGHT};
+    border-radius: 0px;
 }}
 QLabel#CardTitle {{
-    color: #9FB0C4;
+    color: {COLOR_ACCENT};
     font-size: 11px;
     font-weight: 700;
-    letter-spacing: 1.1px;
+    letter-spacing: 2px;
 }}
 QLabel#StatCaption {{
     color: {COLOR_MUTED};
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.8px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1.6px;
 }}
 QLabel#StatValue {{
     color: {COLOR_TEXT};
-    font-size: 26px;
+    font-size: 28px;
     font-weight: 700;
+    letter-spacing: 1px;
 }}
 QLabel#StatValue[state="success"] {{ color: {COLOR_SUCCESS}; }}
 QLabel#StatValue[state="danger"]  {{ color: {COLOR_DANGER}; }}
 QLabel#StatValue[state="accent"]  {{ color: {COLOR_ACCENT}; }}
 QLabel#StatValue[state="warn"]    {{ color: {COLOR_WARN}; }}
 QLabel#StatHint {{
-    color: #5E6E82;
-    font-size: 11px;
+    color: #5D6A77;
+    font-size: 10px;
+    letter-spacing: 0.6px;
 }}
 QLabel#FieldLabel {{
     color: {COLOR_MUTED};
-    font-size: 12px;
+    font-size: 11px;
 }}
 QLabel#Muted {{
     color: {COLOR_MUTED};
-    font-size: 11px;
+    font-size: 10px;
+    letter-spacing: 0.6px;
 }}
 QLabel#FileName {{
-    color: #C6D4E4;
-    font-size: 12px;
+    color: #C3D2E0;
+    font-size: 11px;
     padding: 8px 10px;
     background: {COLOR_PANEL_ALT};
     border: 1px solid {COLOR_BORDER};
-    border-radius: 8px;
-}}
-QLabel#CurrentEmail {{
-    color: {COLOR_TEXT};
-    font-size: 13px;
-    font-weight: 600;
+    border-left: 2px solid {COLOR_ACCENT};
 }}
 QLabel#MiniStat {{
     color: {COLOR_TEXT};
-    font-size: 16px;
+    font-size: 17px;
     font-weight: 700;
 }}
 QLabel#MiniCaption {{
     color: {COLOR_MUTED};
-    font-size: 10px;
-    font-weight: 600;
-    letter-spacing: 0.7px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 1.4px;
 }}
 QFrame#MiniStatBox {{
     background: {COLOR_PANEL_ALT};
-    border: 1px solid #18222E;
-    border-radius: 9px;
+    border: 1px solid {COLOR_BORDER};
+    border-radius: 0px;
 }}
 QFrame#Pill {{
-    background: #16202B;
-    border: 1px solid #22303E;
-    border-radius: 11px;
+    background: {COLOR_PANEL_ALT};
+    border: 1px solid {COLOR_BORDER_LIGHT};
+    border-radius: 0px;
 }}
-QFrame#Pill[state="ok"]    {{ background: rgba(52, 211, 153, 26); border-color: rgba(52, 211, 153, 90); }}
-QFrame#Pill[state="warn"]  {{ background: rgba(245, 184, 81, 26); border-color: rgba(245, 184, 81, 90); }}
-QFrame#Pill[state="error"] {{ background: rgba(248, 113, 113, 26); border-color: rgba(248, 113, 113, 90); }}
-QFrame#Pill[state="busy"]  {{ background: rgba(79, 124, 255, 30); border-color: rgba(79, 124, 255, 90); }}
+QFrame#Pill[state="ok"]    {{ border-color: {COLOR_SUCCESS}; }}
+QFrame#Pill[state="warn"]  {{ border-color: {COLOR_WARN}; }}
+QFrame#Pill[state="error"] {{ border-color: {COLOR_DANGER}; }}
+QFrame#Pill[state="busy"]  {{ border-color: {COLOR_ACCENT}; }}
 QLabel#PillText {{
-    color: #C9D6E5;
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.3px;
+    color: {COLOR_TEXT};
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1.2px;
 }}
-QLabel#PillText[state="ok"]    {{ color: #7FE9C1; }}
-QLabel#PillText[state="warn"]  {{ color: #F8CE86; }}
-QLabel#PillText[state="error"] {{ color: #FCA5A5; }}
-QLabel#PillText[state="busy"]  {{ color: #A9C2FF; }}
+QLabel#PillText[state="ok"]    {{ color: {COLOR_SUCCESS}; }}
+QLabel#PillText[state="warn"]  {{ color: {COLOR_WARN}; }}
+QLabel#PillText[state="error"] {{ color: {COLOR_DANGER}; }}
+QLabel#PillText[state="busy"]  {{ color: {COLOR_ACCENT}; }}
 QLabel#Dot {{
-    font-size: 13px;
-    color: #64748B;
+    font-size: 11px;
+    color: #4A5763;
 }}
 QLabel#Dot[state="ok"]    {{ color: {COLOR_SUCCESS}; }}
 QLabel#Dot[state="warn"]  {{ color: {COLOR_WARN}; }}
@@ -1959,188 +2051,206 @@ QLabel#Dot[state="busy"]  {{ color: {COLOR_ACCENT}; }}
 QLineEdit {{
     background: {COLOR_PANEL_ALT};
     border: 1px solid {COLOR_BORDER};
-    border-radius: 8px;
-    padding: 9px 11px;
+    border-radius: 0px;
+    padding: 8px 10px;
     color: {COLOR_TEXT};
-    font-size: 13px;
+    font-size: 12px;
     selection-background-color: {COLOR_ACCENT};
+    selection-color: #04060A;
 }}
 QLineEdit:focus {{
     border: 1px solid {COLOR_ACCENT};
-    background: #0F1720;
+    background: #0A0F14;
 }}
-QLineEdit:disabled {{ color: #5C6B7D; }}
+QLineEdit:disabled {{ color: #4E5A66; }}
 
 QPushButton {{
-    background: #172231;
-    border: 1px solid #22303F;
-    border-radius: 9px;
-    padding: 9px 14px;
-    color: #D6E2F0;
-    font-size: 12px;
-    font-weight: 600;
+    background: {COLOR_PANEL_ALT};
+    border: 1px solid {COLOR_BORDER_LIGHT};
+    border-radius: 0px;
+    padding: 8px 12px;
+    color: #CAD8E6;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1.2px;
 }}
-QPushButton:hover  {{ background: #1C2938; border-color: #2B3B4D; }}
-QPushButton:pressed {{ background: #131D29; }}
+QPushButton:hover  {{ background: #131A21; border-color: {COLOR_ACCENT}; color: #FFFFFF; }}
+QPushButton:pressed {{ background: #05080B; }}
 QPushButton:disabled {{
-    background: #10171F;
-    border-color: #1A2530;
-    color: #4C5A6B;
+    background: #0A0E12;
+    border-color: #1B242C;
+    color: #46525E;
 }}
 QPushButton#Primary {{
     background: {COLOR_ACCENT};
     border: 1px solid {COLOR_ACCENT};
-    color: #FFFFFF;
-    font-size: 13px;
+    color: #04060A;
+    font-size: 12px;
     font-weight: 700;
-    letter-spacing: 0.4px;
-    padding: 11px 16px;
+    letter-spacing: 2px;
+    padding: 10px 14px;
 }}
 QPushButton#Primary:hover   {{ background: {COLOR_ACCENT_HOVER}; border-color: {COLOR_ACCENT_HOVER}; }}
-QPushButton#Primary:pressed {{ background: #3D68E0; }}
+QPushButton#Primary:pressed {{ background: #3F8EE0; }}
 QPushButton#Primary:disabled {{
-    background: #1A2432;
-    border-color: #22303E;
-    color: #4F5E70;
+    background: #0D141A;
+    border-color: #1F2A33;
+    color: #495663;
 }}
 QPushButton#Danger {{
-    background: rgba(248, 113, 113, 18);
-    border: 1px solid rgba(248, 113, 113, 70);
-    color: #FCA5A5;
+    background: {COLOR_PANEL_ALT};
+    border: 1px solid {COLOR_DANGER};
+    color: {COLOR_DANGER};
 }}
-QPushButton#Danger:hover {{ background: rgba(248, 113, 113, 34); }}
+QPushButton#Danger:hover {{ background: #1A0E10; color: #FF8A8A; }}
 QPushButton#Danger:disabled {{
-    background: #10171F;
-    border-color: #1A2530;
-    color: #4C5A6B;
+    background: #0A0E12;
+    border-color: #1B242C;
+    color: #46525E;
 }}
 QPushButton#Ghost {{
     background: transparent;
-    border: 1px solid #1C2733;
-    color: #93A4B8;
-    font-weight: 500;
-    padding: 7px 10px;
+    border: 1px dashed {COLOR_BORDER_LIGHT};
+    color: {COLOR_MUTED};
+    font-weight: 400;
+    padding: 6px 10px;
 }}
-QPushButton#Ghost:hover {{ background: #141D28; color: #C9D6E5; }}
+QPushButton#Ghost:hover {{ border-color: {COLOR_ACCENT}; color: {COLOR_TEXT}; }}
 QPushButton#Link {{
     background: transparent;
     border: none;
-    color: #8FB0FF;
-    font-size: 11px;
-    font-weight: 600;
+    color: {COLOR_ACCENT};
+    font-size: 10px;
+    font-weight: 700;
     padding: 2px 0;
     text-align: left;
+    letter-spacing: 1px;
 }}
-QPushButton#Link:hover {{ color: #B7CBFF; }}
+QPushButton#Link:hover {{ color: {COLOR_ACCENT_HOVER}; }}
 
 QToolButton#Eye {{
     background: {COLOR_PANEL_ALT};
     border: 1px solid {COLOR_BORDER};
-    border-radius: 8px;
-    color: #9FB0C4;
-    font-size: 11px;
-    font-weight: 600;
+    border-radius: 0px;
+    color: {COLOR_MUTED};
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1px;
     padding: 8px 10px;
 }}
-QToolButton#Eye:hover {{ background: #16202B; color: {COLOR_TEXT}; }}
+QToolButton#Eye:hover {{ border-color: {COLOR_ACCENT}; color: {COLOR_TEXT}; }}
 
 QCheckBox {{
-    color: #9FB0C4;
-    font-size: 11px;
-    spacing: 8px;
+    color: {COLOR_MUTED};
+    font-size: 10px;
+    letter-spacing: 0.6px;
+    spacing: 7px;
 }}
 QCheckBox::indicator {{
-    width: 15px;
-    height: 15px;
-    border-radius: 4px;
-    border: 1px solid #2A3A4B;
+    width: 13px;
+    height: 13px;
+    border-radius: 0px;
+    border: 1px solid {COLOR_BORDER_LIGHT};
     background: {COLOR_PANEL_ALT};
 }}
 QCheckBox::indicator:checked {{
     background: {COLOR_ACCENT};
-    border-color: {COLOR_ACCENT};
+    border: 1px solid {COLOR_ACCENT};
 }}
 
 QPlainTextEdit#LogView {{
-    background: {COLOR_PANEL_ALT};
-    border: 1px solid #18222E;
-    border-radius: 9px;
-    color: #C7D4E3;
-    font-family: {MONO_STACK};
-    font-size: 12px;
+    background: #05080B;
+    border: 1px solid {COLOR_BORDER};
+    border-radius: 0px;
+    color: #C4D3E1;
+    font-size: 11px;
     padding: 8px;
-    selection-background-color: #253752;
+    selection-background-color: {COLOR_ACCENT};
+    selection-color: #04060A;
 }}
 QTabWidget::pane {{
     border: 1px solid {COLOR_BORDER};
-    border-radius: 12px;
+    border-radius: 0px;
     background: {COLOR_PANEL};
     top: -1px;
 }}
 QTabBar::tab {{
-    background: transparent;
-    color: #7E8FA3;
+    background: {COLOR_PANEL_ALT};
+    color: {COLOR_MUTED};
     padding: 8px 16px;
-    margin-right: 4px;
-    border: 1px solid transparent;
-    border-top-left-radius: 9px;
-    border-top-right-radius: 9px;
-    font-size: 12px;
-    font-weight: 600;
+    margin-right: 3px;
+    border: 1px solid {COLOR_BORDER};
+    border-bottom: none;
+    border-radius: 0px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1.6px;
 }}
 QTabBar::tab:selected {{
     color: {COLOR_TEXT};
     background: {COLOR_PANEL};
-    border: 1px solid {COLOR_BORDER};
-    border-bottom-color: {COLOR_PANEL};
+    border-top: 2px solid {COLOR_ACCENT};
 }}
-QTabBar::tab:hover:!selected {{ color: #AFC0D2; }}
+QTabBar::tab:hover:!selected {{ color: {COLOR_TEXT}; border-color: {COLOR_BORDER_LIGHT}; }}
 
 QTableWidget#QueueTable {{
     background: {COLOR_PANEL_ALT};
-    alternate-background-color: #0F1620;
-    border: 1px solid #18222E;
-    border-radius: 9px;
-    color: #C7D4E3;
-    font-size: 12px;
-    gridline-color: transparent;
-}}
-QTableWidget#QueueTable::item {{ padding: 6px 8px; }}
-QHeaderView::section {{
-    background: #131C26;
-    color: #8B9CAF;
-    border: none;
-    border-bottom: 1px solid #1C2836;
-    padding: 7px 8px;
+    alternate-background-color: #0A0E12;
+    border: 1px solid {COLOR_BORDER};
+    border-radius: 0px;
+    color: #C4D3E1;
     font-size: 11px;
+    gridline-color: {COLOR_BORDER};
+}}
+QTableWidget#QueueTable::item {{ padding: 5px 8px; border-bottom: 1px solid #131A21; }}
+QTableWidget#QueueTable::item:selected {{
+    background: #10202F;
+    color: #FFFFFF;
+}}
+QHeaderView::section {{
+    background: {COLOR_PANEL_ALT};
+    color: {COLOR_ACCENT};
+    border: none;
+    border-bottom: 1px solid {COLOR_BORDER_LIGHT};
+    border-right: 1px solid {COLOR_BORDER};
+    padding: 7px 8px;
+    font-size: 10px;
     font-weight: 700;
-    letter-spacing: 0.5px;
+    letter-spacing: 1.4px;
 }}
 QScrollBar:vertical {{
-    background: transparent;
+    background: {COLOR_PANEL_ALT};
     width: 10px;
-    margin: 2px;
+    margin: 0;
+    border-left: 1px solid {COLOR_BORDER};
 }}
 QScrollBar::handle:vertical {{
-    background: #26333F;
-    border-radius: 5px;
-    min-height: 30px;
+    background: {COLOR_BORDER_LIGHT};
+    border-radius: 0px;
+    min-height: 24px;
 }}
-QScrollBar::handle:vertical:hover {{ background: #33424F; }}
+QScrollBar::handle:vertical:hover {{ background: {COLOR_ACCENT}; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
-QScrollBar:horizontal {{ background: transparent; height: 10px; }}
-QScrollBar::handle:horizontal {{ background: #26333F; border-radius: 5px; min-width: 30px; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+QScrollBar:horizontal {{
+    background: {COLOR_PANEL_ALT};
+    height: 10px;
+    border-top: 1px solid {COLOR_BORDER};
+}}
+QScrollBar::handle:horizontal {{ background: {COLOR_BORDER_LIGHT}; border-radius: 0px; min-width: 24px; }}
+QScrollBar::handle:horizontal:hover {{ background: {COLOR_ACCENT}; }}
 
 QToolTip {{
-    background: #16202B;
-    color: #D6E2F0;
-    border: 1px solid #26333F;
-    border-radius: 6px;
-    padding: 6px 8px;
+    background: {COLOR_PANEL};
+    color: {COLOR_TEXT};
+    border: 1px solid {COLOR_ACCENT};
+    border-radius: 0px;
+    padding: 5px 7px;
+    font-size: 10px;
 }}
 QMessageBox {{ background: {COLOR_PANEL}; }}
-QMessageBox QLabel {{ color: {COLOR_TEXT}; font-size: 13px; }}
+QMessageBox QLabel {{ color: {COLOR_TEXT}; font-size: 12px; }}
+QMessageBox QPushButton {{ min-width: 84px; }}
 """
 
 
@@ -2154,22 +2264,19 @@ def repolish(widget: QWidget) -> None:
 
 
 def build_app_icon() -> QIcon:
-    """Small generated icon so the window has an identity without assets."""
+    """Generated square icon so the window has an identity without assets."""
     pixmap = QPixmap(64, 64)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    gradient = QLinearGradient(0, 0, 64, 64)
-    gradient.setColorAt(0.0, QColor("#5B8CFF"))
-    gradient.setColorAt(1.0, QColor("#2F4FD8"))
-    painter.setBrush(gradient)
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.drawRoundedRect(2, 2, 60, 60, 16, 16)
-    font = QFont()
+    painter.setBrush(QColor("#0C1014"))
+    painter.setPen(QPen(QColor(COLOR_ACCENT), 3))
+    painter.drawRect(1, 1, 61, 61)
+    font = QFont(FONT_FAMILY)
     font.setBold(True)
-    font.setPixelSize(34)
+    font.setPixelSize(38)
     painter.setFont(font)
-    painter.setPen(QPen(QColor("#FFFFFF")))
+    painter.setPen(QPen(QColor(COLOR_ACCENT), 1))
     # PyQt6 wants a plain int for the flags argument of this overload.
     painter.drawText(pixmap.rect(), int(Qt.AlignmentFlag.AlignCenter), "V")
     painter.end()
@@ -2328,9 +2435,9 @@ _STATUS_STATES = {
 }
 
 _LOG_COLORS = {
-    "info": "#8FA5BC",
-    "step": "#A9BDD4",
-    "check": "#7FB7E8",
+    "info": "#8B9AAB",
+    "step": "#AFC0D0",
+    "check": "#5AA9FF",
     "success": COLOR_SUCCESS,
     "warn": COLOR_WARN,
     "error": COLOR_DANGER,
@@ -2416,7 +2523,7 @@ class MainWindow(QMainWindow):
 
         titles = QVBoxLayout()
         titles.setSpacing(1)
-        title = QLabel(APP_NAME)
+        title = QLabel(APP_NAME.upper())
         title.setObjectName("AppTitle")
         tagline = QLabel(APP_TAGLINE)
         tagline.setObjectName("AppTagline")
@@ -2435,7 +2542,7 @@ class MainWindow(QMainWindow):
         self.app_pill.set_state("idle", "●  Idle")
         layout.addWidget(self.app_pill)
 
-        version = QLabel(f"v{APP_VERSION}")
+        version = QLabel(f"BUILD {APP_VERSION}")
         version.setObjectName("Version")
         layout.addWidget(version)
         return header
@@ -2474,10 +2581,10 @@ class MainWindow(QMainWindow):
         import_card = Card("Email import", "TXT · one address per line")
         upload_row = QHBoxLayout()
         upload_row.setSpacing(8)
-        self.btn_upload = QPushButton("Upload TXT…")
+        self.btn_upload = QPushButton("UPLOAD TXT")
         self.btn_upload.setObjectName("Primary")
         self.btn_upload.clicked.connect(self.choose_file)
-        self.btn_reload = QPushButton("Reload")
+        self.btn_reload = QPushButton("RELOAD")
         self.btn_reload.setObjectName("Ghost")
         self.btn_reload.clicked.connect(self.reload_file)
         self.btn_reload.setEnabled(False)
@@ -2520,7 +2627,7 @@ class MainWindow(QMainWindow):
         self.txt_password.setClearButtonEnabled(False)
         self.btn_eye = QToolButton()
         self.btn_eye.setObjectName("Eye")
-        self.btn_eye.setText("Show")
+        self.btn_eye.setText("SHOW")
         self.btn_eye.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_eye.setCheckable(True)
         self.btn_eye.setToolTip("Show or hide the password")
@@ -2530,7 +2637,7 @@ class MainWindow(QMainWindow):
         password_card.add_layout(pw_row)
 
         defaults_row = QHBoxLayout()
-        self.btn_default_pw = QPushButton("Use configured DEFAULT_PASSWORD")
+        self.btn_default_pw = QPushButton("USE CONFIGURED DEFAULT_PASSWORD")
         self.btn_default_pw.setObjectName("Link")
         self.btn_default_pw.clicked.connect(self._apply_password_default)
         defaults_row.addWidget(self.btn_default_pw)
@@ -2548,14 +2655,14 @@ class MainWindow(QMainWindow):
         control_card = Card("Run controls", "one browser task at a time")
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
-        self.btn_start = QPushButton("▶  START")
+        self.btn_start = QPushButton(">> START")
         self.btn_start.setObjectName("Primary")
         self.btn_start.clicked.connect(self.start_processing)
-        self.btn_pause = QPushButton("Pause")
+        self.btn_pause = QPushButton("PAUSE")
         self.btn_pause.clicked.connect(self.pause_processing)
-        self.btn_resume = QPushButton("Resume")
+        self.btn_resume = QPushButton("RESUME")
         self.btn_resume.clicked.connect(self.resume_processing)
-        self.btn_stop = QPushButton("Stop")
+        self.btn_stop = QPushButton("STOP")
         self.btn_stop.setObjectName("Danger")
         self.btn_stop.clicked.connect(self.stop_processing)
         for button in (self.btn_start, self.btn_pause, self.btn_resume, self.btn_stop):
@@ -2571,7 +2678,7 @@ class MainWindow(QMainWindow):
         )
         options_row.addWidget(self.chk_open_live_view)
         options_row.addStretch(1)
-        self.btn_check_api = QPushButton("Test API connection")
+        self.btn_check_api = QPushButton("TEST API CONNECTION")
         self.btn_check_api.setObjectName("Ghost")
         self.btn_check_api.clicked.connect(self.check_connection)
         options_row.addWidget(self.btn_check_api)
@@ -2591,11 +2698,11 @@ class MainWindow(QMainWindow):
                                                f"{self._store.key_path.name}")
         export_row = QHBoxLayout()
         export_row.setSpacing(8)
-        self.btn_export = QPushButton("Export CSV…")
+        self.btn_export = QPushButton("EXPORT CSV")
         self.btn_export.clicked.connect(self.export_csv)
-        self.btn_folder = QPushButton("Open folder")
+        self.btn_folder = QPushButton("OPEN FOLDER")
         self.btn_folder.clicked.connect(self.open_output_folder)
-        self.btn_clear = QPushButton("Clear completed")
+        self.btn_clear = QPushButton("CLEAR COMPLETED")
         self.btn_clear.setObjectName("Danger")
         self.btn_clear.clicked.connect(self.clear_completed)
         for button in (self.btn_export, self.btn_folder, self.btn_clear):
@@ -2641,7 +2748,7 @@ class MainWindow(QMainWindow):
         label.setObjectName("CardTitle")
         toolbar.addWidget(label)
         toolbar.addStretch(1)
-        self.btn_clear_log = QPushButton("Clear log")
+        self.btn_clear_log = QPushButton("CLEAR LOG")
         self.btn_clear_log.setObjectName("Ghost")
         self.btn_clear_log.clicked.connect(self.clear_log)
         toolbar.addWidget(self.btn_clear_log)
@@ -2763,7 +2870,7 @@ class MainWindow(QMainWindow):
         self.txt_password.setEchoMode(
             QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
         )
-        self.btn_eye.setText("Hide" if visible else "Show")
+        self.btn_eye.setText("HIDE" if visible else "SHOW")
 
     # ==================================================================
     #  Logging
@@ -2771,13 +2878,14 @@ class MainWindow(QMainWindow):
     def _log(self, level: str, message: str) -> None:
         level = level if level in _LOG_COLORS else "info"
         colour = _LOG_COLORS[level]
-        tag = {"info": "INFO", "step": "STEP", "check": "CHECK", "success": " OK ",
-               "warn": "WARN", "error": "FAIL"}[level]
+        tag = {"info": "INFO ", "step": "STEP ", "check": "CHECK", "success": "OK   ",
+               "warn": "WARN ", "error": "FAIL "}[level]
         safe = html.escape(message)
         self.log_view.appendHtml(
-            f"<span style='color:#586A7E'>{clock()}</span>&nbsp;&nbsp;"
-            f"<span style='color:{colour};font-weight:600'>[{tag}]</span>&nbsp;&nbsp;"
-            f"<span style='color:{'#C7D4E3' if level == 'info' else colour}'>{safe}</span>"
+            f"<span style='color:#4E5A66'>{clock()}</span>&nbsp;"
+            f"<span style='color:#2F3A45'>|</span>&nbsp;"
+            f"<span style='color:{colour};font-weight:700'>[{tag}]</span>&nbsp;"
+            f"<span style='color:{'#C4D3E1' if level == 'info' else colour}'>{safe}</span>"
         )
         self.lbl_footer.setText(f"{clock()}  ·  {message[:150]}")
         bar = self.log_view.verticalScrollBar()
