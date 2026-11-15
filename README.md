@@ -35,9 +35,9 @@ Everything lives in the configuration block at the top of `main.py`:
 
 | Setting | Purpose |
 | --- | --- |
-| `BROWSER_USE_API_KEY` | Browser Use Cloud API key (`X-Browser-Use-API-Key`) |
-| `TARGET_URL` | Authorized staging signup page |
-| `DEFAULT_PASSWORD` | Test-account password (prefills the password field) |
+| `BROWSER_USE_API_KEY` | Browser Use Cloud API key (`X-Browser-Use-API-Key`) — already set to yours |
+| `TARGET_URL` | Authorized signup page — defaults to `https://veriphone.io/signup` |
+| `DEFAULT_PASSWORD` | Test-account password — defaults to your configured password |
 | `OUTPUT_FILE` / `KEY_OUTPUT_FILE` | `results.csv` / `key.txt` |
 | `BROWSER_USE_MAX_COST` | Per-task cost ceiling in USD (`maxCostUsd`) |
 | `OUTPUT_DIR` | Optional absolute folder for the output files |
@@ -56,9 +56,13 @@ For local secrets you can also drop a `_overrides.local.py` next to `main.py`
 (git-ignored); only names already defined in the config block are accepted:
 
 ```python
-BROWSER_USE_API_KEY = "bu_live_..."
-DEFAULT_PASSWORD = "Staging!Pass9"
+BROWSER_USE_API_KEY = "bu_..."      # per-machine override
+TARGET_URL = "https://veriphone.io/signup"
+DEFAULT_PASSWORD = "..."
 ```
+
+> The three values above ship pre-filled in `main.py`. Keep that file private —
+> it contains your Browser Use key and the test password.
 
 ## 3. Using the app
 
@@ -116,6 +120,17 @@ CREDENTIAL_HINT = "Settings > Developer > Test API keys"
 A captured key is written to `key.txt` (masked everywhere else). If the
 dashboard is reached but no key exists, the task still completes and the log
 warns you that nothing was displayed — nothing is ever invented.
+
+**The account's own key is always in scope.** The agent is told explicitly that
+the key in *this* account's API panel is the deliverable: copy it verbatim,
+prefix included (`bu_...`), and its key-like format or length is **not** a
+reason to withhold it. Only other people's credentials, cookies, session tokens
+and production secrets are off limits.
+
+Addresses that already exist no longer dead-end: if signup reports “account
+already exists”, the agent signs in with the same e-mail and test password and
+continues to the dashboard to read the key. That outcome still records
+`COMPLETED` (with a log note that signup was skipped).
 
 ### When a task parks as `WAITING_FOR_USER`
 
