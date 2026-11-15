@@ -956,36 +956,6 @@ class EmailnatorDirect:
             finally:
                 browser.close()
 
-    def fetch_n_mailboxes(self, n: int) -> list[str]:
-        """Open Emailnator ``n`` times, click "Go !", return ``n`` real temp mailbox addresses."""
-        mailboxes: list[str] = []
-        with sync_playwright() as p:  # type: ignore[attr-defined]
-            browser = p.chromium.launch(headless=self.headless)
-            try:
-                for _ in range(n):
-                    page = browser.new_page()
-                    try:
-                        page.goto(self.emailnator_url, wait_until="domcontentloaded")
-                        go_btn = page.locator('button[name="goBtn"], input[name="goBtn"]').first
-                        if go_btn.count() == 0:
-                            go_btn = page.get_by_role("button", name="Go !").first
-                        go_btn.click()
-                        page.wait_for_load_state("networkidle")
-                        deadline = time.monotonic() + self.timeout_seconds
-                        mailbox = ""
-                        while time.monotonic() < deadline:
-                            mailbox = self._read_mailbox(page)
-                            if mailbox:
-                                break
-                            page.wait_for_timeout(1000)
-                        if mailbox:
-                            mailboxes.append(mailbox)
-                    finally:
-                        page.close()
-            finally:
-                browser.close()
-        return mailboxes
-
     def verify_inbox(
         self,
         emailnator_url: str | None = None,
@@ -1702,9 +1672,6 @@ class BrowserUseService:
             kwargs["model"] = self.model
         if self.verification_enabled:
             kwargs["output_schema"] = FLOW_OUTPUT_SCHEMA
-            # Only pass a pre-fetched real mailbox; placeholders mean "generate
-            # during the run" instead.
-            real_email = None if email.endswith("@emailnator-temp.invalid") else email
             return self.client().runs.create(
                 build_full_flow_prompt(
                     self.target_url,
@@ -1714,7 +1681,6 @@ class BrowserUseService:
                     EXPECTED_ACTION_URL,
                     EXPECTED_MODE,
                     self.credential_hint,
-                    email=real_email,
                 ),
                 **kwargs,
             )
@@ -2213,7 +2179,6 @@ def build_full_flow_prompt(
     expected_action_url: str,
     expected_mode: str,
     credential_hint: str = "",
-    email: str | None = None,
 ) -> str:
     """Compose the browser-agent instruction for the full authorised flow:
 
@@ -2224,9 +2189,8 @@ def build_full_flow_prompt(
     5. Return to the SAME Emailnator inbox and find the verification message.
     6. Open it and validate the verification link points to the expected service + mode=verifyEmail.
 
-    When ``email`` is provided, it is a real temp mailbox already fetched from
-    Emailnator — the agent uses it for sign-up and verification instead of
-    generating a new one during the run.
+    The temp mailbox is generated during the run (not imported), so signup and
+    verification share the exact same inbox. Nothing is bypassed.
     """
     hint = (credential_hint or "").strip()
     if hint:
@@ -2259,48 +2223,7 @@ def build_full_flow_prompt(
             "credential_location = \"not_found\". Never invent a value."
         )
 
-    if email:
-        # Real temp mailbox pre-fetched from Emailnator — use it directly.
-        steps = f"""Steps
-1. Open the VeriPhone signup page ({target_url}). Sign up using the pre-fetched
-   temp mailbox "{email}" as the account e-mail and the test password (the
-   password is injected from the secret binding — never echo it in your text
-   output). Submit the form.
-2. STOP ONLY for a real human challenge: a CAPTCHA, a "verify you are human"
-   check, an SMS/authenticator code prompt, or a hard rate-limit wall. In that
-   case set human_verification_required = true, set blocker to exactly one of
-   captcha / phone_verification / other, and describe it in failure_reason.
-   Do NOT attempt to solve, bypass or retry it.
-3. PASSIVE NOTICES ARE NOT BLOCKERS. If you only see a notice such as "Email
-   not verified", "Verify your e-mail to unlock everything", a pending-verification
-   banner or a "resend verification" link, record it in verification_error and
-   KEEP GOING. These staging flows normally show the dashboard immediately after
-   signup — do not stop, do not log out, do not open a different e-mail inbox.
-4. Continue to the dashboard (often the page right after signup). Confirm the
-   test account is authenticated (account menu, avatar or e-mail visible). If
-   signup says the account already exists, do NOT stop and do NOT re-register:
-   sign in through the normal login page with "{email}" and the same test
-   password, then continue to step 5. Only report failure if sign-in is
-   genuinely refused.
-5. {credential_step}
-6. Now verify the e-mail: open Emailnator ({emailnator_url}) and look for the
-   temp inbox "{email}". Open it and look for a message from {sender} with
-   subject "{subject}". Ignore unrelated messages. Record sender/subject of
-   the match.
-7. Open the matching verification message and inspect its content. Find the
-   verification destination link. Validate that the destination belongs to
-   {expected_action_url} and carries mode={expected_mode}. Record action_url
-   and mode.
-8. Determine verification_status:
-   - completed: a usable verification link exists and points to
-     {expected_action_url}?mode={expected_mode}
-   - pending: the message was received but no usable verification link yet
-   - expired: the message/link indicates it has expired
-   - requires_action: the message asks the user to act before verification
-   - failed: inbox unavailable, message not received, unexpected sender,
-     incorrect subject, or the link does not belong to the expected service"""
-    else:
-        steps = f"""Steps
+    steps = f"""Steps
 1. Open Emailnator ({emailnator_url}). Wait for the inbox interface to load.
 2. Click the inbox initialisation control: the button with name="goBtn" and
    visible text "Go !". Wait for the inbox to become available.
@@ -2348,7 +2271,6 @@ production systems, real payment details or third-party accounts.
 
 Target signup page: {target_url}
 Target temporary inbox: {emailnator_url}
-{"Pre-fetched temp mailbox: " + email if email else ""}
 Expected verification sender: {sender}
 Expected verification subject: "{subject}"
 Expected verification destination: {expected_action_url}
@@ -3425,7 +3347,6 @@ class MainWindow(QMainWindow):
         # ---- state ------------------------------------------------------
         self._store = ResultStore()
         self._verification_store = VerificationStore()
-        self._emailnator_direct: EmailnatorDirect | None = None
         self._tasks: list[EmailTask] = []
         self._task_index: dict[str, EmailTask] = {}
         self._import_path: Path | None = None
@@ -4108,96 +4029,19 @@ class MainWindow(QMainWindow):
     def _is_busy(self) -> bool:
         return self._worker is not None and self._worker.isRunning()
 
-    def _get_emailnator_direct(self) -> EmailnatorDirect | None:
-        """Create (once) the Playwright direct-DOM driver for Emailnator."""
-        if not EMAIL_VERIFY_DIRECT_DOM:
-            return None
-        if not PLAYWRIGHT_AVAILABLE:
-            self._log(
-                "error",
-                "playwright is not installed. Run: pip install playwright && "
-                "playwright install chromium",
-            )
-            return None
-        if self._emailnator_direct is None:
-            try:
-                self._emailnator_direct = EmailnatorDirect()
-            except EmailnatorDirectError as exc:
-                self._log("error", f"Direct DOM driver: {exc}")
-                return None
-        return self._emailnator_direct
-
     def generate_queue(self) -> None:
-        """Build N queue entries from the "API keys to create" spin box.
+        """Build N placeholder queue entries from the "API keys to create" spin box.
 
-        When e-mail verification is enabled and Direct DOM is on, each entry is
-        a REAL temp mailbox fetched from Emailnator (open inbox → click "Go !"
-        → read address). Otherwise placeholder labels are used.
+        Entries are queue labels only — the real Emailnator temp mailbox is not
+        known until each run starts (open Emailnator → click "Go !" → read the
+        generated address). That real mailbox is then used for both sign-up and
+        verification, and is recorded in results.csv / verification_results.csv
+        when the run completes.
         """
         if self._is_busy():
             self._log("warn", "A queue is already running — cannot generate now.")
             return
         count = int(self.spn_keys_count.value())
-        added = 0
-
-        if EMAIL_VERIFICATION_ENABLED:
-            direct = self._get_emailnator_direct()
-            if direct is not None:
-                try:
-                    self._log(
-                        "info",
-                        f"Fetching {count} real temp mailbox(es) from Emailnator "
-                        f"({EMAILNATOR_URL})…",
-                    )
-                    real_mailboxes = direct.fetch_n_mailboxes(count)
-                    for mailbox in real_mailboxes:
-                        if any(
-                            t.email.casefold() == mailbox.casefold()
-                            for t in self._tasks
-                        ):
-                            continue
-                        task = EmailTask(email=mailbox)
-                        self._tasks.append(task)
-                        added += 1
-                    self._log(
-                        "info",
-                        f"Fetched {added} real temp mailbox(es) from Emailnator "
-                        f"(total {len(self._tasks)} queue entr{'y' if added == 1 else 'ies'}).",
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    self._log(
-                        "error",
-                        f"Could not fetch real mailboxes from Emailnator: {exc}",
-                    )
-                    self._log(
-                        "warn",
-                        "Falling back to placeholder queue entries — real emails "
-                        "won't be available until each run generates its own inbox.",
-                    )
-                    added = self._add_placeholder_queue(count)
-            else:
-                self._log(
-                    "warn",
-                    "Direct DOM driver unavailable — enable “Direct DOM (fast, no "
-                    "LLM agent)” to fetch real Emailnator mailboxes, or import a "
-                    "TXT file with real addresses instead.",
-                )
-                added = self._add_placeholder_queue(count)
-        else:
-            added = self._add_placeholder_queue(count)
-
-        self._rebuild_task_index()
-        self._refresh_derived_counts()
-        self._update_controls()
-        if EMAIL_VERIFICATION_ENABLED:
-            self._log(
-                "info",
-                "Verification enabled → each run: sign-up → capture key → "
-                f"verify that same temp inbox → {VERIFICATION_RESULTS_FILE}.",
-            )
-
-    def _add_placeholder_queue(self, count: int) -> int:
-        """Append placeholder queue entries (used when real mailboxes can't be fetched)."""
         added = 0
         for i in range(1, count + 1):
             email = f"temp-mailbox-{i}@emailnator-temp.invalid"
@@ -4206,7 +4050,22 @@ class MainWindow(QMainWindow):
             task = EmailTask(email=email)
             self._tasks.append(task)
             added += 1
-        return added
+        self._rebuild_task_index()
+        self._refresh_derived_counts()
+        self._update_controls()
+        self._log(
+            "info",
+            f"Generated {added} queue entr{'y' if added == 1 else 'ies'} "
+            f"(total {len(self._tasks)}). Placeholder labels only — each run "
+            f"generates its own real Emailnator temp mailbox when it starts.",
+        )
+        if EMAIL_VERIFICATION_ENABLED:
+            self._log(
+                "info",
+                "Verification enabled → each run opens Emailnator, reads its "
+                f"temp mailbox, signs up with it, captures the key, then "
+                f"verifies that same inbox → {VERIFICATION_RESULTS_FILE}.",
+            )
 
     def _rebuild_task_index(self) -> None:
         self._task_index = {t.email.casefold(): t for t in self._tasks}
