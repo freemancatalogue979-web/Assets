@@ -753,6 +753,14 @@ TASK_OUTPUT_SCHEMA: dict[str, Any] = {
             "type": "boolean",
             "description": "True if a CAPTCHA/verification step blocked progress.",
         },
+        "blocker": {
+            "type": "string",
+            "description": (
+                "What blocked the run when human_verification_required is true. One of: "
+                "captcha, email_verification, phone_verification, rate_limit, other. "
+                "Empty otherwise."
+            ),
+        },
         "failure_reason": {
             "type": "string",
             "description": "Short, human-readable reason when a check failed.",
@@ -783,6 +791,81 @@ class TaskOutcome:
     duration_seconds: float | None = None
     recoverable: bool = False
     notes: list[str] = field(default_factory=list)
+
+
+# Guidance shown when a run parks as WAITING_FOR_USER. Deliberately specific:
+# "solve the challenge in the live view" is useless advice for an inbox check.
+_WAITING_GUIDANCE: dict[str, str] = {
+    "captcha": (
+        "A human-verification challenge blocked the run. Open the live browser view, "
+        "solve it there if you are authorized to, then re-run this address."
+    ),
+    "email_verification": (
+        "Registration requires e-mail verification. Nothing was bypassed — confirm the "
+        "test inbox/mail fixture for this address, then re-run it."
+    ),
+    "phone_verification": (
+        "Registration requires phone verification. Nothing was bypassed — use the "
+        "approved test number or fixture, then re-run this address."
+    ),
+    "rate_limit": (
+        "The target rate-limited this run. Nothing was bypassed — wait for the limit to "
+        "reset, then re-run this address."
+    ),
+}
+
+_DEFAULT_WAITING_GUIDANCE = (
+    "An account-protection step blocked the run and was not bypassed. Review the notice, "
+    "resolve it through the approved test path, then re-run this address."
+)
+
+_BLOCKER_ALIASES = {
+    "email": "email_verification",
+    "email_verify": "email_verification",
+    "verify_email": "email_verification",
+    "email_not_verified": "email_verification",
+    "phone": "phone_verification",
+    "phone_verify": "phone_verification",
+    "verify_phone": "phone_verification",
+    "sms": "phone_verification",
+    "otp": "other",
+    "too many": "rate_limit",
+    "2fa": "other",
+    "two_factor": "other",
+    "recaptcha": "captcha",
+    "hcaptcha": "captcha",
+    "human_verification": "captcha",
+    "human": "captcha",
+    "throttle": "rate_limit",
+    "throttled": "rate_limit",
+    "rate_limit": "rate_limit",
+    "rate_limited": "rate_limit",
+    "too_many_requests": "rate_limit",
+}
+
+
+def normalize_blocker(blocker: str, failure_reason: str = "") -> str:
+    """Map the agent's blocker (or free text) onto a known blocker key."""
+    # The agent's explicit blocker wins; free text is only a fallback.
+    raw = blocker.strip().lower() or failure_reason.lower()
+    for key, value in _BLOCKER_ALIASES.items():
+        if key in raw.replace("-", "_"):
+            return value
+    for key in _WAITING_GUIDANCE:
+        if key in raw:
+            return key
+    return ""
+
+
+def waiting_message(blocker: str, failure_reason: str = "") -> str:
+    """Explain a WAITING_FOR_USER stop in terms of what actually blocked it."""
+    key = normalize_blocker(blocker, failure_reason)
+    guidance = _WAITING_GUIDANCE.get(key, _DEFAULT_WAITING_GUIDANCE)
+    reason = (failure_reason or "").strip()
+    if reason and reason.lower() not in guidance.lower():
+        reason = reason.splitlines()[0][:180]
+        return f"{reason} — {guidance}"
+    return guidance
 
 
 @dataclass
@@ -817,8 +900,9 @@ Steps
 4. Submit the form.
 5. If a CAPTCHA, e-mail verification, phone verification, rate limit or any
    other account protection appears: STOP immediately. Do NOT attempt to solve,
-   bypass or retry it. Report human_verification_required = true and describe
-   the challenge.
+   bypass or retry it. Set human_verification_required = true, set blocker to
+   exactly one of captcha / email_verification / phone_verification /
+   rate_limit / other, and describe the notice you saw in failure_reason.
 6. If registration succeeds, confirm the app lands on the expected dashboard and
    that the test account is authenticated (account menu / e-mail visible).
 7. Locate the dashboard's test-credential panel and read the approved test
@@ -1303,10 +1387,10 @@ class BrowserUseService:
             )
 
         if _boolish(output.get("human_verification_required")):
+            blocker = str(output.get("blocker") or "").strip()
             return TaskOutcome(
                 status=TaskStatus.WAITING_FOR_USER,
-                error=("Human verification blocked the run. Complete the challenge in the "
-                       "live browser view, then re-run this address."),
+                error=waiting_message(blocker, str(output.get("failure_reason") or "")),
                 task_id=run_id,
                 session_id=session_id,
                 live_url=live_url,
@@ -1660,6 +1744,15 @@ class QueueWorker(QThread):
             task.notes = outcome.notes
             task.finished_at = now_iso()
             break
+
+        if task.status is TaskStatus.WAITING_FOR_USER:
+            self._emit_log(
+                "warn",
+                f"{task.email} — parked as WAITING_FOR_USER. Resolve the block through the "
+                f"approved test path, then re-run it with START.",
+            )
+            if task.live_url:
+                self._emit_log("info", f"{task.email} — live browser view: {task.live_url}")
 
         level = {
             TaskStatus.COMPLETED: "success",

@@ -75,6 +75,24 @@ DEFAULT_PASSWORD = "Staging!Pass9"
 Statuses: `PENDING`, `RUNNING`, `WAITING_FOR_USER`, `COMPLETED`, `FAILED`,
 `CANCELLED`.
 
+### When a task parks as `WAITING_FOR_USER`
+
+The app never bypasses a protection, so it explains whichever blocker it hit
+instead of assuming a CAPTCHA:
+
+| Blocker | What the operator is told |
+| --- | --- |
+| `captcha` | Solve the challenge yourself in the live view, then re-run the address |
+| `email_verification` | Confirm the test inbox / mail fixture for that address, then re-run it |
+| `phone_verification` | Use the approved test number / fixture, then re-run it |
+| `rate_limit` | Wait for the limit to reset, then re-run it |
+| anything else | Review the notice, resolve it via the approved test path, re-run |
+
+The agent reports the blocker through the `blocker` field; free-text notices
+(such as “Email not verified”) are also recognised. The parked task keeps its
+`WAITING_FOR_USER` row, and **START** re-queues it (together with `FAILED` and
+`CANCELLED` rows) without touching completed results.
+
 ## 4. What a task actually does
 
 `BrowserUseService.create_run()` posts to `POST /api/v4/runs` with:
@@ -83,8 +101,8 @@ Statuses: `PENDING`, `RUNNING`, `WAITING_FOR_USER`, `COMPLETED`, `FAILED`,
   test-credential panel) that explicitly forbids bypassing protections,
 * an `outputSchema` so each run returns structured fields
   (`signup_completed`, `dashboard_reached`, `account_email`,
-  `test_credential`, `human_verification_required`, `failure_reason`,
-  `checks`),
+  `test_credential`, `human_verification_required`, `blocker`,
+  `failure_reason`, `checks`),
 * a `maxCostUsd` ceiling,
 * a `secretBindings` entry for the password, restricted to the target host —
   the password is never inlined in the task text,
@@ -134,7 +152,7 @@ credentials.
 | 429/5xx/network hiccup | Recoverable: retried (`MAX_TASK_RETRIES`) |
 | Status polling keeps failing | Bounded by the task watchdog, run cancelled |
 | Task timeout | Run cancelled, task `FAILED` (recoverable) |
-| CAPTCHA / verification | `WAITING_FOR_USER`, live view linked |
+| CAPTCHA / verification / e-mail check / rate limit | `WAITING_FOR_USER` with blocker-specific guidance, live view linked |
 | Dashboard check fails | `FAILED` with the agent's reason |
 | `results.csv`/`key.txt` locked | Log + dialog explaining what to close |
 
