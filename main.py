@@ -956,6 +956,29 @@ class EmailnatorDirect:
             finally:
                 browser.close()
 
+    def fetch_one_mailbox(self) -> str:
+        """Open Emailnator, click "Go !", return the real temp mailbox address."""
+        with sync_playwright() as p:  # type: ignore[attr-defined]
+            browser = p.chromium.launch(headless=self.headless)
+            try:
+                page = browser.new_page()
+                page.goto(self.emailnator_url, wait_until="domcontentloaded")
+                go_btn = page.locator('button[name="goBtn"], input[name="goBtn"]').first
+                if go_btn.count() == 0:
+                    go_btn = page.get_by_role("button", name="Go !").first
+                go_btn.click()
+                page.wait_for_load_state("networkidle")
+                deadline = time.monotonic() + self.timeout_seconds
+                mailbox = ""
+                while time.monotonic() < deadline:
+                    mailbox = self._read_mailbox(page)
+                    if mailbox:
+                        break
+                    page.wait_for_timeout(1000)
+                return mailbox
+            finally:
+                browser.close()
+
     def verify_inbox(
         self,
         emailnator_url: str | None = None,
@@ -1681,6 +1704,7 @@ class BrowserUseService:
                     EXPECTED_ACTION_URL,
                     EXPECTED_MODE,
                     self.credential_hint,
+                    email=email,
                 ),
                 **kwargs,
             )
@@ -2179,18 +2203,13 @@ def build_full_flow_prompt(
     expected_action_url: str,
     expected_mode: str,
     credential_hint: str = "",
+    email: str | None = None,
 ) -> str:
-    """Compose the browser-agent instruction for the full authorised flow:
+    """Compose the browser-agent instruction for the full authorised flow.
 
-    1. Open Emailnator, click the "Go !" inbox initialisation control (name="goBtn").
-    2. Read the generated temp mailbox address.
-    3. Sign up on the VeriPhone staging page using that temp mailbox.
-    4. Reach the dashboard and capture the account's test API key verbatim.
-    5. Return to the SAME Emailnator inbox and find the verification message.
-    6. Open it and validate the verification link points to the expected service + mode=verifyEmail.
-
-    The temp mailbox is generated during the run (not imported), so signup and
-    verification share the exact same inbox. Nothing is bypassed.
+    When ``email`` is provided, it is a real temp mailbox already fetched from
+    Emailnator — the agent uses it for sign-up and verification instead of
+    generating a new one during the run.
     """
     hint = (credential_hint or "").strip()
     if hint:
@@ -2223,67 +2242,74 @@ def build_full_flow_prompt(
             "credential_location = \"not_found\". Never invent a value."
         )
 
-    steps = f"""Steps
+    if email:
+        # Real temp mailbox pre-fetched from Emailnator — use it directly.
+        steps = f"""Steps
+1. Open the VeriPhone signup page ({target_url}).
+2. Sign up using the temp mailbox "{email}" as the account e-mail — this is a
+   REAL temp mailbox obtained from Emailnator. Never use "TASK-N" as an e-mail
+   address; it has no "@" and will be rejected.
+   Enter the test password (injected from the secret binding — never echo it).
+   Submit the form.
+3. STOP ONLY for a real human challenge: CAPTCHA, "verify you are human",
+   SMS/authenticator prompt, or hard rate-limit wall. Set
+   human_verification_required = true and blocker to captcha / phone_verification /
+   other. Do NOT attempt to solve, bypass or retry it.
+4. PASSIVE NOTICES ARE NOT BLOCKERS. A notice like "Email not verified" or
+   "resend verification" is recorded only — keep going to the dashboard.
+5. Continue to the dashboard. Confirm the test account is authenticated. If signup
+   says the account already exists, sign in with "{email}" and the same test
+   password, then continue to step 6.
+6. {credential_step}
+7. Now verify the e-mail: open Emailnator ({emailnator_url}) and look for the
+   temp inbox "{email}". Find a message from {sender} with subject "{subject}".
+   Open it, find the verification destination link, and validate that it belongs
+   to {expected_action_url} and carries mode={expected_mode}. Record action_url
+   and mode.
+8. Determine verification_status:
+   - completed: a usable verification link exists pointing to
+     {expected_action_url}?mode={expected_mode}
+   - pending: message received but no usable verification link yet
+   - expired: the message/link has expired
+   - requires_action: the message asks the user to act first
+   - failed: inbox unavailable, message not received, wrong sender/subject,
+     or link does not belong to the expected service"""
+    else:
+        # No pre-fetched mailbox — agent must generate one from Emailnator.
+        steps = f"""Steps
 1. Open Emailnator ({emailnator_url}). Wait for the inbox interface to load.
-2. Click the inbox initialisation control: the button with name="goBtn" and
-   visible text "Go !". Wait for the inbox to become available.
-3. READ the REAL generated temp mailbox address shown by Emailnator on screen.
-   It will look like a real e-mail address (e.g. pechh.ux.ley@googlemail.com).
-   Record it in mailbox. The queue task label "TASK-N" is NOT an e-mail address
-   — never type it into an e-mail field. It has no "@" and will be rejected.
+2. Click the inbox initialisation control: button name="goBtn" / text "Go !".
+   Wait for the inbox to become available.
+3. READ the REAL generated temp mailbox address shown by Emailnator (e.g.
+   pechh.ux.ley@googlemail.com). Record it in mailbox. The queue label "TASK-N"
+   is NOT an e-mail address — never type it into an e-mail field.
 4. Open the VeriPhone signup page ({target_url}). Sign up using the REAL temp
-   mailbox you read in step 3 as the account e-mail — NOT the queue label —
-   and the test password (the password is injected from the secret binding —
-   never echo it in your text output). Submit the form.
-5. STOP ONLY for a real human challenge: a CAPTCHA, a "verify you are human"
-   check, an SMS/authenticator code prompt, or a hard rate-limit wall. In that
-   case set human_verification_required = true, set blocker to exactly one of
-   captcha / phone_verification / other, and describe it in failure_reason.
-   Do NOT attempt to solve, bypass or retry it.
-6. PASSIVE NOTICES ARE NOT BLOCKERS. If you only see a notice such as "Email
-   not verified", "Verify your e-mail to unlock everything", a pending-verification
-   banner or a "resend verification" link, record it in verification_error and
-   KEEP GOING. These staging flows normally show the dashboard immediately after
-   signup — do not stop, do not log out, do not open a different e-mail inbox.
-7. Continue to the dashboard (often the page right after signup). Confirm the
-   test account is authenticated (account menu, avatar or e-mail visible). If
-   signup says the account already exists, do NOT stop and do NOT re-register:
-   sign in through the normal login page with the REAL temp mailbox from step 3
-   and the same test password, then continue to step 8. Only report failure if
-   sign-in is genuinely refused.
+   mailbox from step 3 — NOT the queue label — and the test password (injected
+   from the secret binding — never echo it). Submit the form.
+5. STOP ONLY for a real human challenge: CAPTCHA, "verify you are human",
+   SMS/authenticator prompt, or hard rate-limit wall. Set human_verification_required
+   = true and blocker to captcha / phone_verification / other. Do NOT solve or bypass it.
+6. PASSIVE NOTICES ARE NOT BLOCKERS. Record notices like "Email not verified" and
+   KEEP GOING to the dashboard.
+7. Continue to the dashboard. Confirm the test account is authenticated. If signup
+   says the account already exists, sign in with the temp mailbox from step 3 and
+   the same test password, then continue to step 8.
 8. {credential_step}
-9. Now verify the e-mail: return to Emailnator and open the SAME temp inbox
-   (the mailbox from step 3). Look for a message from {sender} with subject
-   "{subject}". Ignore unrelated messages. Record sender/subject of the match.
-10. Open the matching verification message and inspect its content. Find the
-    verification destination link. Validate that the destination belongs to
-    {expected_action_url} and carries mode={expected_mode}. Record action_url
-    and mode.
+9. Return to Emailnator and open the SAME temp inbox (mailbox from step 3).
+   Find a message from {sender} with subject "{subject}". Record sender/subject.
+10. Open the verification message. Find the verification destination link. Validate
+    that it belongs to {expected_action_url} and carries mode={expected_mode}.
+    Record action_url and mode.
 11. Determine verification_status:
-    - completed: a usable verification link exists and points to
-      {expected_action_url}?mode={expected_mode}
-    - pending: the message was received but no usable verification link yet
-    - expired: the message/link indicates it has expired
-    - requires_action: the message asks the user to act before verification
-    - failed: inbox unavailable, message not received, unexpected sender,
-      incorrect subject, or the link does not belong to the expected service"""
+    - completed: usable link to {expected_action_url}?mode={expected_mode}
+    - pending: message received but no usable link yet
+    - expired: message/link has expired
+    - requires_action: message asks user to act first
+    - failed: inbox unavailable, message not received, wrong sender/subject,
+      or link does not belong to expected service"""
 
-    return f"""⚠️ CRITICAL ⚠️ READ FIRST — YOU MUST DO THIS IN ORDER:
-
-1. FIRST: Open Emailnator ({emailnator_url}). Click the "Go !" button (name="goBtn").
-   Wait for the inbox to load. READ the generated temp mailbox address shown on screen.
-   This is a REAL e-mail address (example: pechh.ux.ley@googlemail.com). Record it.
-
-2. THEN: Go to the VeriPhone signup page ({target_url}) and sign up using THAT REAL
-   temp mailbox as the account e-mail. NEVER use the queue task label as an e-mail.
-
-🚫 STOP: The queue task label (e.g. "TASK-1") is ONLY a tracking label. It is NOT an
-   e-mail address. It has no "@" symbol. NEVER type it into an e-mail field. If you
-   type "TASK-1" into the e-mail field, native validation will reject it and signup
-   will fail. You must use the real temp mailbox from Emailnator.
-
-Only use the pages described below; never touch production systems, real payment
-details or third-party accounts.
+    return f"""You are running an AUTHORIZED QA test of a staging registration flow.
+Only use the pages described below; never touch production systems.
 
 Target signup page: {target_url}
 Target temporary inbox: {emailnator_url}
@@ -2291,14 +2317,14 @@ Expected verification sender: {sender}
 Expected verification subject: "{subject}"
 Expected verification destination: {expected_action_url}
 Expected operation: mode={expected_mode}
+{f'Pre-fetched temp mailbox: {email}' if email else ''}
 
 {steps}
 
-Report the result using the provided output schema. Set signup_completed and
-dashboard_reached honestly; put a short reason in failure_reason when a step
-failed, and list the checks you performed in "checks". Only report what you
-observe. Never solve a CAPTCHA, never bypass a protection, and never open
-links other than the verification destination above."""
+Report using the output schema. Set signup_completed and dashboard_reached
+honestly. Put a short reason in failure_reason when a step failed. List checks
+in "checks". Only report what you observe. Never solve a CAPTCHA, never bypass a
+protection, and never open links other than the verification destination above."""
 
 
 def _validate_action_url(action_url: str, expected_action_url: str, expected_mode: str) -> bool:
@@ -2470,6 +2496,7 @@ class QueueWorker(QThread):
         store: ResultStore,
         *,
         verification_store: VerificationStore | None = None,
+        emailnator_direct: EmailnatorDirect | None = None,
         max_retries: int = MAX_TASK_RETRIES,
         between_task_delay: float = DELAY_BETWEEN_TASKS_SECONDS,
         parent: QObject | None = None,
@@ -2479,6 +2506,7 @@ class QueueWorker(QThread):
         self._tasks = [task.copy() for task in tasks]
         self._store = store
         self._verification_store = verification_store
+        self._emailnator_direct = emailnator_direct
         self._max_retries = max(0, int(max_retries))
         self._delay = max(0.0, float(between_task_delay))
         self._stop = threading.Event()
@@ -2633,9 +2661,31 @@ class QueueWorker(QThread):
                 self.task_updated.emit(task.copy())
                 self._persist(task)
 
+            # --- fetch real temp mailbox from Emailnator before the run -----
+            run_email = task.email  # default: queue label (agent generates mailbox itself)
+            if self._service.verification_enabled and self._emailnator_direct is not None:
+                try:
+                    real_mailbox = self._emailnator_direct.fetch_one_mailbox()
+                    if real_mailbox:
+                        run_email = real_mailbox
+                        self._emit_log(
+                            "info",
+                            f"{task.email} — temp mailbox obtained from Emailnator: {real_mailbox}",
+                        )
+                    else:
+                        self._emit_log(
+                            "warn",
+                            f"{task.email} — Emailnator did not return a mailbox; using queue label.",
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    self._emit_log(
+                        "warn",
+                        f"{task.email} — Could not fetch temp mailbox from Emailnator: {exc}. Using queue label.",
+                    )
+
             try:
                 outcome = self._service.execute(
-                    task.email,
+                    run_email,  # real mailbox from Emailnator, not the queue label
                     emit=emit,
                     should_stop=self._stop.is_set,
                     on_run_created=on_created,
@@ -4208,20 +4258,41 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, APP_NAME, f"Configuration error:\n\n{exc}")
             return
 
+        # Optional direct-DOM driver for fetching real temp mailboxes from Emailnator.
+        emailnator_direct = None
         if EMAIL_VERIFICATION_ENABLED:
             self._log(
                 "info",
                 f"E-mail verification enabled → {VERIFICATION_RESULTS_FILE} "
                 f"(sender {VERIFICATION_SENDER}, subject “{VERIFICATION_SUBJECT}”). "
-                "Each run generates a temp Emailnator inbox, signs up with it, "
+                "Each run fetches a real temp mailbox from Emailnator, signs up with it, "
                 "captures the key, then verifies that same inbox.",
             )
+            if EMAIL_VERIFY_DIRECT_DOM and PLAYWRIGHT_AVAILABLE:
+                try:
+                    emailnator_direct = EmailnatorDirect()
+                except EmailnatorDirectError as exc:
+                    self._log("error", f"Direct DOM driver: {exc}")
+            elif EMAIL_VERIFY_DIRECT_DOM and not PLAYWRIGHT_AVAILABLE:
+                self._log(
+                    "error",
+                    "Direct DOM enabled but playwright is not installed. "
+                    "Run: pip install playwright && playwright install chromium",
+                )
+            else:
+                self._log(
+                    "warn",
+                    "Direct DOM driver not enabled — the agent will try to generate "
+                    "the temp mailbox from Emailnator itself (may be unreliable). "
+                    "Enable “Direct DOM (fast, no LLM agent)” to fetch real mailboxes.",
+                )
 
         self._worker = QueueWorker(
             self._service,
             queue,
             self._store,
             verification_store=self._verification_store,
+            emailnator_direct=emailnator_direct,
             parent=self,
         )
         worker = self._worker
