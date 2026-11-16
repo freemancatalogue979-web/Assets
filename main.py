@@ -2662,7 +2662,7 @@ class QueueWorker(QThread):
                 self._persist(task)
 
             # --- fetch real temp mailbox from Emailnator before the run -----
-            run_email = task.email  # default: queue label (agent generates mailbox itself)
+            run_email = None  # None = agent generates mailbox from Emailnator itself
             if self._service.verification_enabled and self._emailnator_direct is not None:
                 try:
                     real_mailbox = self._emailnator_direct.fetch_one_mailbox()
@@ -2674,13 +2674,15 @@ class QueueWorker(QThread):
                         )
                     else:
                         self._emit_log(
-                            "warn",
-                            f"{task.email} — Emailnator did not return a mailbox; using queue label.",
+                            "info",
+                            f"{task.email} — Emailnator did not return a mailbox; "
+                            f"agent will generate one itself.",
                         )
                 except Exception as exc:  # noqa: BLE001
                     self._emit_log(
-                        "warn",
-                        f"{task.email} — Could not fetch temp mailbox from Emailnator: {exc}. Using queue label.",
+                        "info",
+                        f"{task.email} — Could not fetch temp mailbox from Emailnator: "
+                        f"{exc}; agent will generate one itself.",
                     )
 
             try:
