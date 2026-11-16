@@ -2227,10 +2227,10 @@ def build_full_flow_prompt(
 1. Open Emailnator ({emailnator_url}). Wait for the inbox interface to load.
 2. Click the inbox initialisation control: the button with name="goBtn" and
    visible text "Go !". Wait for the inbox to become available.
-3. READ the generated temp mailbox address shown by Emailnator. It will look
-   like a real e-mail address (e.g. something@emailnator.com). Record it in
-   mailbox. The queue label "account-N" is NOT an e-mail address — never type
-   it into an e-mail field.
+3. READ the REAL generated temp mailbox address shown by Emailnator on screen.
+   It will look like a real e-mail address (e.g. pechh.ux.ley@googlemail.com).
+   Record it in mailbox. The queue task label "TASK-N" is NOT an e-mail address
+   — never type it into an e-mail field. It has no "@" and will be rejected.
 4. Open the VeriPhone signup page ({target_url}). Sign up using the REAL temp
    mailbox you read in step 3 as the account e-mail — NOT the queue label —
    and the test password (the password is injected from the secret binding —
@@ -2268,9 +2268,22 @@ def build_full_flow_prompt(
     - failed: inbox unavailable, message not received, unexpected sender,
       incorrect subject, or the link does not belong to the expected service"""
 
-    return f"""You are running an AUTHORIZED automated QA test of a staging registration
-flow that the operator owns. Only use the pages described below; never touch
-production systems, real payment details or third-party accounts.
+    return f"""⚠️ CRITICAL ⚠️ READ FIRST — YOU MUST DO THIS IN ORDER:
+
+1. FIRST: Open Emailnator ({emailnator_url}). Click the "Go !" button (name="goBtn").
+   Wait for the inbox to load. READ the generated temp mailbox address shown on screen.
+   This is a REAL e-mail address (example: pechh.ux.ley@googlemail.com). Record it.
+
+2. THEN: Go to the VeriPhone signup page ({target_url}) and sign up using THAT REAL
+   temp mailbox as the account e-mail. NEVER use the queue task label as an e-mail.
+
+🚫 STOP: The queue task label (e.g. "TASK-1") is ONLY a tracking label. It is NOT an
+   e-mail address. It has no "@" symbol. NEVER type it into an e-mail field. If you
+   type "TASK-1" into the e-mail field, native validation will reject it and signup
+   will fail. You must use the real temp mailbox from Emailnator.
+
+Only use the pages described below; never touch production systems, real payment
+details or third-party accounts.
 
 Target signup page: {target_url}
 Target temporary inbox: {emailnator_url}
@@ -4088,7 +4101,7 @@ class MainWindow(QMainWindow):
         count = int(self.spn_keys_count.value())
         added = 0
         for i in range(1, count + 1):
-            label = f"account-{i}"
+            label = f"TASK-{i}"
             if any(t.email.casefold() == label.casefold() for t in self._tasks):
                 continue
             task = EmailTask(email=label)
