@@ -2210,7 +2210,8 @@ def build_full_flow_prompt(
     When ``email`` is a non-empty string, it is a real temp mailbox already
     fetched from Emailnator — the agent uses it for sign-up and verification
     instead of generating a new one during the run. When empty, the agent must
-    open Emailnator itself, click "Go !", and read the generated mailbox.
+    open Emailnator itself, click "Go !", read the generated mailbox, and use
+    it for sign-up.
     """
     hint = (credential_hint or "").strip()
     if hint:
@@ -2243,19 +2244,10 @@ def build_full_flow_prompt(
             "credential_location = \"not_found\". Never invent a value."
         )
 
-    # Build the header separately to avoid nested f-strings.
-    pre_fetched_line = ""
+    # Build the steps as plain string concatenation (no nested f-strings).
     if email:
-        pre_fetched_line = (
-            f"Pre-fetched temp mailbox: {email}\n"
-            f"IMPORTANT: Use this exact address as the account e-mail. Do NOT use "
-            f"the queue task label (TASK-N) — it has no \"@\" and will be rejected."
-        )
-
-    if email:
-        # Real temp mailbox pre-fetched from Emailnator — use it directly.
         steps = (
-            "Steps\n"
+            "MANDATORY ORDER — DO NOT SKIP STEP 1:\n"
             "1. Open the VeriPhone signup page (" + target_url + ").\n"
             "2. Sign up using the temp mailbox \"" + email + "\" as the account e-mail — "
             "this is a REAL temp mailbox obtained from Emailnator. Never use \"TASK-N\" "
@@ -2287,15 +2279,16 @@ def build_full_flow_prompt(
             "     or link does not belong to the expected service"
         )
     else:
-        # No pre-fetched mailbox — agent must generate one from Emailnator.
         steps = (
-            "Steps\n"
+            "MANDATORY ORDER — YOU MUST DO STEP 1 BEFORE STEP 2.\n"
+            "DO NOT go straight to the signup page with \"TASK-N\" — it is not an e-mail.\n"
             "1. Open Emailnator (" + emailnator_url + "). Wait for the inbox interface to load.\n"
             "2. Click the inbox initialisation control: button name=\"goBtn\" / text \"Go !\".\n"
             "   Wait for the inbox to become available.\n"
             "3. READ the REAL generated temp mailbox address shown by Emailnator (e.g.\n"
             "   pechh.ux.ley@googlemail.com). Record it in mailbox. The queue label \"TASK-N\"\n"
-            "   is NOT an e-mail address — never type it into an e-mail field.\n"
+            "   is NOT an e-mail address — never type it into an e-mail field. It has no \"@\"\n"
+            "   and will be rejected by native email validation.\n"
             "4. Open the VeriPhone signup page (" + target_url + "). Sign up using the REAL temp\n"
             "   mailbox from step 3 — NOT the queue label — and the test password (injected\n"
             "   from the secret binding — never echo it). Submit the form.\n"
@@ -2323,6 +2316,15 @@ def build_full_flow_prompt(
         )
 
     header = (
+        "⚠️ CRITICAL ⚠️ READ FIRST — YOU MUST GET A REAL E-MAIL FROM EMAILNATOR BEFORE SIGNUP\n\n"
+        "The queue task label (e.g. \"TASK-1\") is ONLY a tracking label. It is NOT an e-mail\n"
+        "address. It has no \"@\" symbol. NEVER type \"TASK-1\" into an e-mail field — native\n"
+        "validation will reject it and signup will fail.\n\n"
+        "You MUST:\n"
+        "  a) Open Emailnator (" + emailnator_url + "), click \"Go !\" (name=\"goBtn\"), and read the\n"
+        "     REAL temp mailbox address shown on screen (e.g. pechh.ux.ley@googlemail.com).\n"
+        "  b) Use THAT REAL mailbox as the account e-mail on the signup page.\n\n"
+        "Only then proceed to sign-up, dashboard, credential capture, and verification.\n\n"
         "You are running an AUTHORIZED QA test of a staging registration flow.\n"
         "Only use the pages described below; never touch production systems.\n\n"
         "Target signup page: " + target_url + "\n"
@@ -2332,8 +2334,12 @@ def build_full_flow_prompt(
         "Expected verification destination: " + expected_action_url + "\n"
         "Expected operation: mode=" + expected_mode + "\n"
     )
-    if pre_fetched_line:
-        header += "\n" + pre_fetched_line + "\n"
+    if email:
+        header += (
+            "Pre-fetched temp mailbox: " + email + "\n"
+            "IMPORTANT: Use this exact address as the account e-mail. Do NOT use the\n"
+            "queue task label (TASK-N) — it has no \"@\" and will be rejected.\n"
+        )
 
     return header + "\n" + steps + "\n\nReport using the output schema. Set signup_completed and dashboard_reached\nhonestly. Put a short reason in failure_reason when a step failed. List checks\nin \"checks\". Only report what you observe. Never solve a CAPTCHA, never bypass a\nprotection, and never open links other than the verification destination above."
 
@@ -2507,7 +2513,6 @@ class QueueWorker(QThread):
         store: ResultStore,
         *,
         verification_store: VerificationStore | None = None,
-        emailnator_direct: EmailnatorDirect | None = None,
         max_retries: int = MAX_TASK_RETRIES,
         between_task_delay: float = DELAY_BETWEEN_TASKS_SECONDS,
         parent: QObject | None = None,
@@ -2517,7 +2522,6 @@ class QueueWorker(QThread):
         self._tasks = [task.copy() for task in tasks]
         self._store = store
         self._verification_store = verification_store
-        self._emailnator_direct = emailnator_direct
         self._max_retries = max(0, int(max_retries))
         self._delay = max(0.0, float(between_task_delay))
         self._stop = threading.Event()
@@ -2672,60 +2676,14 @@ class QueueWorker(QThread):
                 self.task_updated.emit(task.copy())
                 self._persist(task)
 
-            # --- fetch real temp mailbox from Emailnator before the run -----
-            run_email = ""  # empty = agent must generate mailbox from Emailnator itself
-            if self._service.verification_enabled:
-                if self._emailnator_direct is None:
-                    # Direct DOM not available — cannot reliably obtain a real
-                    # temp mailbox. Fail this task instead of passing "" or
-                    # the queue label to the signup form.
-                    self._emit_log(
-                        "error",
-                        f"{task.email} — Direct DOM driver is not available. "
-                        f"Enable “Direct DOM (fast, no LLM agent)” and install "
-                        f"playwright (pip install playwright && "
-                        f"playwright install chromium) so a real Emailnator "
-                        f"temp mailbox can be fetched before signup.",
-                    )
-                    task.status = TaskStatus.FAILED
-                    task.error_message = (
-                        "Direct DOM driver unavailable — cannot obtain real "
-                        "Emailnator temp mailbox for verification."
-                    )
-                    task.finished_at = now_iso()
-                    self.task_updated.emit(task.copy())
-                    self._persist(task)
-                    break
-                try:
-                    real_mailbox = self._emailnator_direct.fetch_one_mailbox()
-                    if real_mailbox:
-                        run_email = real_mailbox
-                        self._emit_log(
-                            "info",
-                            f"{task.email} — temp mailbox obtained from Emailnator: {real_mailbox}",
-                        )
-                    else:
-                        self._emit_log(
-                            "warn",
-                            f"{task.email} — Emailnator did not return a mailbox; "
-                            f"agent will attempt to generate one itself.",
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    self._emit_log(
-                        "error",
-                        f"{task.email} — Could not fetch temp mailbox from Emailnator: "
-                        f"{exc}. Cannot proceed with verification signup.",
-                    )
-                    task.status = TaskStatus.FAILED
-                    task.error_message = f"Emailnator mailbox fetch failed: {exc}"
-                    task.finished_at = now_iso()
-                    self.task_updated.emit(task.copy())
-                    self._persist(task)
-                    break
+            # run_email = "" means the agent opens Emailnator itself, clicks
+            # "Go !", reads the generated temp mailbox, and uses it for sign-up
+            # (see the empty-email branch of build_full_flow_prompt).
+            run_email = ""
 
             try:
                 outcome = self._service.execute(
-                    run_email,  # real mailbox from Emailnator, not the queue label
+                    run_email,  # empty string → agent fetches mailbox from Emailnator itself
                     emit=emit,
                     should_stop=self._stop.is_set,
                     on_run_created=on_created,
@@ -3724,15 +3682,6 @@ class MainWindow(QMainWindow):
         self.btn_generate_queue.clicked.connect(self.generate_queue)
         options_row.addWidget(self.btn_generate_queue)
 
-        self.chk_direct_dom = QCheckBox("Direct DOM (fast, no LLM agent)")
-        self.chk_direct_dom.setChecked(EMAIL_VERIFY_DIRECT_DOM)
-        self.chk_direct_dom.setToolTip(
-            "Drive Emailnator with Playwright instead of the Browser Use LLM agent. "
-            "Requires playwright + a Chromium browser and network access to "
-            "emailnator.com; not reachable from this sandbox, so the cloud agent is "
-            "used by default."
-        )
-        options_row.addWidget(self.chk_direct_dom)
         options_row.addStretch(1)
         self.btn_check_api = QPushButton("TEST API CONNECTION")
         self.btn_check_api.setObjectName("Ghost")
@@ -4298,41 +4247,21 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, APP_NAME, f"Configuration error:\n\n{exc}")
             return
 
-        # Optional direct-DOM driver for fetching real temp mailboxes from Emailnator.
-        emailnator_direct = None
         if EMAIL_VERIFICATION_ENABLED:
             self._log(
                 "info",
                 f"E-mail verification enabled → {VERIFICATION_RESULTS_FILE} "
                 f"(sender {VERIFICATION_SENDER}, subject “{VERIFICATION_SUBJECT}”). "
-                "Each run fetches a real temp mailbox from Emailnator, signs up with it, "
-                "captures the key, then verifies that same inbox.",
+                "Each run: agent opens Emailnator, clicks “Go !”, reads the real "
+                "temp mailbox, signs up with it, captures the key, then verifies "
+                "that same inbox.",
             )
-            if EMAIL_VERIFY_DIRECT_DOM and PLAYWRIGHT_AVAILABLE:
-                try:
-                    emailnator_direct = EmailnatorDirect()
-                except EmailnatorDirectError as exc:
-                    self._log("error", f"Direct DOM driver: {exc}")
-            elif EMAIL_VERIFY_DIRECT_DOM and not PLAYWRIGHT_AVAILABLE:
-                self._log(
-                    "error",
-                    "Direct DOM enabled but playwright is not installed. "
-                    "Run: pip install playwright && playwright install chromium",
-                )
-            else:
-                self._log(
-                    "warn",
-                    "Direct DOM driver not enabled — the agent will try to generate "
-                    "the temp mailbox from Emailnator itself (may be unreliable). "
-                    "Enable “Direct DOM (fast, no LLM agent)” to fetch real mailboxes.",
-                )
 
         self._worker = QueueWorker(
             self._service,
             queue,
             self._store,
             verification_store=self._verification_store,
-            emailnator_direct=emailnator_direct,
             parent=self,
         )
         worker = self._worker
