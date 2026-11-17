@@ -109,7 +109,7 @@ CREDENTIAL_HINT = ""
 # message from VERIFICATION_SENDER with VERIFICATION_SUBJECT, opens it and
 # validates the verification link. Results are appended to
 # VERIFICATION_RESULTS_FILE (never truncated).
-EMAIL_VERIFICATION_ENABLED = False
+EMAIL_VERIFICATION_ENABLED = True
 
 # Emailnator temporary inbox.
 EMAILNATOR_URL = "https://www.emailnator.com/"
@@ -142,8 +142,8 @@ EMAIL_VERIFICATION_REQUIRED = False
 # verification message without the Browser Use LLM agent — faster and cheaper.
 # Requires Playwright browsers installed and network access to emailnator.com
 # (not reachable from this sandbox), so the Browser Use cloud agent remains the
-# default. Left False here; flip to True and install playwright to use it.
-EMAIL_VERIFY_DIRECT_DOM = False
+# default. Flip to True and install playwright to use it.
+EMAIL_VERIFY_DIRECT_DOM = True
 
 # ==========================================================================
 #  End of configuration
@@ -4306,7 +4306,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, APP_NAME, f"Configuration error:\n\n{exc}")
             return
 
-        # Optional direct-DOM driver for fetching real temp mailboxes from Emailnator.
+        # Direct-DOM driver (Playwright) is required for e-mail verification:
+        # it fetches a real temp mailbox from Emailnator before each signup run.
         emailnator_direct = None
         if EMAIL_VERIFICATION_ENABLED:
             self._log(
@@ -4316,24 +4317,36 @@ class MainWindow(QMainWindow):
                 "Each run fetches a real temp mailbox from Emailnator via Playwright, "
                 "signs up with it, captures the key, then verifies that same inbox.",
             )
-            if self.chk_direct_dom.isChecked() and PLAYWRIGHT_AVAILABLE:
-                try:
-                    emailnator_direct = EmailnatorDirect()
-                except EmailnatorDirectError as exc:
-                    self._log("error", f"Direct DOM driver: {exc}")
-            elif self.chk_direct_dom.isChecked() and not PLAYWRIGHT_AVAILABLE:
-                self._log(
-                    "error",
-                    "Direct DOM enabled but playwright is not installed. "
-                    "Run: pip install playwright && playwright install chromium",
+            if not self.chk_direct_dom.isChecked():
+                QMessageBox.critical(
+                    self,
+                    APP_NAME,
+                    "Direct DOM is required for e-mail verification.\n\n"
+                    "Check “Direct DOM (fast, no LLM agent)” in Setup & controls, "
+                    "then click START again.",
                 )
-            else:
-                self._log(
-                    "error",
-                    "Direct DOM driver is required for e-mail verification but is not "
-                    "enabled. Check “Direct DOM (fast, no LLM agent)” in Setup & "
-                    "controls, or disable e-mail verification.",
+                return
+            if not PLAYWRIGHT_AVAILABLE:
+                QMessageBox.critical(
+                    self,
+                    APP_NAME,
+                    "Playwright is not installed.\n\n"
+                    "Run: pip install playwright\n"
+                    "Then: playwright install chromium\n"
+                    "Then restart the app and click START again.",
                 )
+                return
+            try:
+                emailnator_direct = EmailnatorDirect()
+            except EmailnatorDirectError as exc:
+                QMessageBox.critical(
+                    self,
+                    APP_NAME,
+                    f"Direct DOM driver failed to start:\n\n{exc}\n\n"
+                    "Make sure playwright + Chromium are installed:\n"
+                    "pip install playwright && playwright install chromium",
+                )
+                return
 
         self._worker = QueueWorker(
             self._service,
